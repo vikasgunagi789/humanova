@@ -67,6 +67,9 @@ async function api(path, options = {}) {
     ...options,
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(localStorage.getItem("humanova_token")
+        ? { Authorization: `Bearer ${localStorage.getItem("humanova_token")}` }
+        : {}),
       ...options.headers,
     },
   });
@@ -234,6 +237,12 @@ function Field({ label, children }) {
 function App() {
   // All React hooks belong inside the component.
   const [page, setPage] = useState("dashboard");
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem("humanova_token") || "");
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authMode, setAuthMode] = useState("login");
+  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [dashboard, setDashboard] = useState({});
   const [requests, setRequests] = useState([]);
   const [resources, setResources] = useState([]);
@@ -252,6 +261,9 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
   useState("All");
 
   const [form, setForm] = useState(EMPTY_FORM);
+  const [aiAnalysis, setAiAnalysis] = useState(null);
+const [aiLoading, setAiLoading] = useState(false);
+const [aiMatchingUsed, setAiMatchingUsed] = useState(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -309,15 +321,132 @@ setEmergency(normalizeEmergency(emergencyData));
   }, []);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    let active = true;
+    if (!authToken) {
+      setCurrentUser(null);
+      setLoading(false);
+      return () => { active = false; };
+    }
+    api("/auth/me")
+      .then((data) => {
+        if (!active) return;
+        setCurrentUser(data.user || null);
+        refresh();
+      })
+      .catch((err) => {
+        if (!active) return;
+        localStorage.removeItem("humanova_token");
+        setAuthToken("");
+        setCurrentUser(null);
+        setAuthError(err.message || "Please sign in again.");
+        setLoading(false);
+      });
+    return () => { active = false; };
+  }, [authToken, refresh]);
 
-  const openForm = (type) => {
-    setForm({ ...EMPTY_FORM });
-    setShowForm(type);
+  const submitAuth = async (event) => {
+    event.preventDefault();
+    if (authBusy) return;
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const endpoint = authMode === "register" ? "/auth/register" : "/auth/login";
+      const payload = authMode === "register"
+        ? { name: authForm.name.trim(), email: authForm.email.trim(), password: authForm.password }
+        : { email: authForm.email.trim(), password: authForm.password };
+      const result = await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
+      localStorage.setItem("humanova_token", result.token);
+      setAuthToken(result.token);
+      setCurrentUser(result.user || null);
+      setAuthForm({ name: "", email: "", password: "" });
+    } catch (err) {
+      setAuthError(err.message || "Authentication failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const signOut = () => {
+    localStorage.removeItem("humanova_token");
+    setAuthToken("");
+    setCurrentUser(null);
+    setPage("dashboard");
+    setRequests([]);
+    setResources([]);
+    setAllocations([]);
+    setDashboard({});
     setNotice("");
     setError("");
   };
+
+  
+const openForm = (type) => {
+  setForm({ ...EMPTY_FORM });
+  setAiAnalysis(null);
+  setAiLoading(false);
+  setShowForm(type);
+  setNotice("");
+  setError("");
+};
+
+const analyzeNeedWithAI = async () => {
+  if (showForm !== "request" || aiLoading) return;
+
+  if (!form.title.trim()) {
+    setError("Enter a request title before using AI analysis.");
+    return;
+  }
+
+  setAiLoading(true);
+  setError("");
+  setNotice("");
+  setAiAnalysis(null);
+
+  try {
+    const result = await api("/ai/analyze-need", {
+      method: "POST",
+      body: JSON.stringify({
+        title: form.title.trim(),
+        description: form.description.trim(),
+        category: form.category,
+        quantity: Number(form.quantity),
+        location: form.location.trim(),
+      }),
+    });
+
+    const analysis = result?.analysis ?? result?.data ?? result;
+
+    if (!analysis || typeof analysis !== "object") {
+      throw new Error("The AI endpoint returned an unexpected response.");
+    }
+
+    setAiAnalysis(analysis);
+  } catch (err) {
+    setError(err.message || "AI analysis could not be completed.");
+  } finally {
+    setAiLoading(false);
+  }
+};
+
+const applyAIRecommendations = () => {
+  if (!aiAnalysis) return;
+
+  const suggestedCategory = aiAnalysis.suggestedCategory;
+  const suggestedUrgency = aiAnalysis.suggestedUrgency;
+
+  setForm((current) => ({
+    ...current,
+    ...(CATEGORIES.includes(suggestedCategory)
+      ? { category: suggestedCategory }
+      : {}),
+    ...(URGENCIES.includes(suggestedUrgency)
+      ? { urgency: suggestedUrgency }
+      : {}),
+  }));
+
+  setNotice("AI suggestions applied. Review them before submitting.");
+};
+
 
   const submitForm = async (event) => {
     event.preventDefault();
@@ -362,27 +491,33 @@ setEmergency(normalizeEmergency(emergencyData));
     }
   };
 
-  const viewMatches = async (request) => {
-    if (!request?._id) {
-      setError("This request has no valid ID.");
-      return;
-    }
+  
+const viewMatches = async (request) => {
+  if (!request?._id) {
+    setError("This request has no valid ID.");
+    return;
+  }
 
-    setSelected(request);
-    setPage("matches");
-    setMatches([]);
-    setError("");
+  setSelected(request);
+  setPage("matches");
+  setMatches([]);
+  setAiMatchingUsed(null);
+  setError("");
+  setNotice("");
 
-    try {
-      const data = await api(
-        `/matches/${encodeURIComponent(request._id)}`
-      );
+  try {
+    const data = await api(
+      `/ai/matches/${encodeURIComponent(request._id)}`
+    );
 
-      setMatches(Array.isArray(data?.matches) ? data.matches : []);
-    } catch (err) {
-      setError(err.message || "Unable to load matching resources.");
-    }
-  };
+    setMatches(Array.isArray(data?.matches) ? data.matches : []);
+    setAiMatchingUsed(data?.aiEnhanced === true);
+  } catch (err) {
+    setAiMatchingUsed(false);
+    setError(err.message || "Unable to load AI recommendations.");
+  }
+};
+
 
   const allocateResource = async (request, match) => {
     const resource = match?.resource;
@@ -426,8 +561,11 @@ setEmergency(normalizeEmergency(emergencyData));
       );
       setAllocationQuantities((old) => ({ ...old, [resource._id]: "" }));
       await refresh();
-      const updated = await api(`/matches/${encodeURIComponent(request._id)}`);
+      const updated = await api(
+  `/ai/matches/${encodeURIComponent(request._id)}`
+);
       setMatches(Array.isArray(updated?.matches) ? updated.matches : []);
+      setAiMatchingUsed(updated?.aiEnhanced === true);
       const updatedRequest = updated?.request || request;
       setSelected(updatedRequest);
     } catch (err) {
@@ -506,10 +644,12 @@ async function cancelAllocation(allocation) {
 
       if (page === "matches") {
         const data = await api(
-          `/matches/${encodeURIComponent(updatedRequest._id)}`
+          `/ai/matches/${encodeURIComponent(updatedRequest._id)}`
         );
 
         setMatches(Array.isArray(data?.matches) ? data.matches : []);
+        setAiMatchingUsed(data?.aiEnhanced === true);
+        setSelected(data?.request || updatedRequest);
       }
     } catch (err) {
       setError(err.message || "Unable to update the request status.");
@@ -629,6 +769,37 @@ const filteredAllocations = allocations.filter((allocation) => {
 
   const crisisAreas = buildCrisisRadar(activeEmergencyRequests);
 
+  if (!authToken || !currentUser) {
+    return (
+      <div className="auth-shell">
+        <section className="auth-visual">
+          <div className="auth-brand"><span className="auth-brand-mark"><HeartHandshake size={26} /></span><span>humanova<span className="auth-dot">.</span></span></div>
+          <div className="auth-hero-copy">
+            <span className="auth-kicker">COMMUNITY IMPACT NETWORK</span>
+            <h1>Small acts.<br /><em>Meaningful change.</em></h1>
+            <p>Connect community needs with the resources and people ready to help.</p>
+            <div className="auth-visual-points"><span><HandHeart size={17} /> Coordinate community needs</span><span><Package size={17} /> Put resources to good use</span><span><ShieldCheck size={17} /> Keep your workspace protected</span></div>
+          </div>
+          <div className="auth-visual-footer">A better way to support one another.</div>
+        </section>
+        <section className="auth-panel-wrap">
+          <form className="auth-panel" onSubmit={submitAuth}>
+            <span className="auth-kicker">WELCOME TO HUMANOVA</span>
+            <h2>{authMode === "register" ? "Create your account" : "Welcome back"}</h2>
+            <p className="auth-subtitle">{authMode === "register" ? "Join your community's resource network." : "Sign in to continue to your community workspace."}</p>
+            {authError && <div className="auth-error" role="alert">{authError}</div>}
+            {authMode === "register" && <label className="auth-field">Full name<input autoComplete="name" value={authForm.name} onChange={(e) => setAuthForm((v) => ({ ...v, name: e.target.value }))} placeholder="Your name" required minLength={2} /></label>}
+            <label className="auth-field">Email address<input type="email" autoComplete="email" value={authForm.email} onChange={(e) => setAuthForm((v) => ({ ...v, email: e.target.value }))} placeholder="you@example.com" required /></label>
+            <label className="auth-field">Password<input type="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} value={authForm.password} onChange={(e) => setAuthForm((v) => ({ ...v, password: e.target.value }))} placeholder={authMode === "register" ? "At least 8 characters" : "Enter your password"} required minLength={authMode === "register" ? 8 : 1} /></label>
+            <button className="btn primary auth-submit" type="submit" disabled={authBusy}>{authBusy ? "Please wait…" : authMode === "register" ? "Create account" : "Sign in"}<ArrowRight size={17} /></button>
+            <p className="auth-switch">{authMode === "register" ? "Already have an account?" : "New to Humanova?"} <button type="button" onClick={() => { setAuthMode(authMode === "register" ? "login" : "register"); setAuthError(""); }}>{authMode === "register" ? "Sign in" : "Create an account"}</button></p>
+            <p className="auth-security"><ShieldCheck size={14} /> Your account is protected with password hashing and signed sessions.</p>
+          </form>
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -695,6 +866,7 @@ const filteredAllocations = allocations.filter((allocation) => {
             <span />
             API connected when available
           </div>
+          <div className="signed-in-user"><span className="user-avatar">{(currentUser?.name || "U").slice(0, 1).toUpperCase()}</span><span className="signed-in-copy"><strong>{currentUser?.name || "Community member"}</strong><small>{currentUser?.email || "Signed in"}</small></span><button type="button" className="signout-button" onClick={signOut} title="Sign out" aria-label="Sign out"><X size={16} /></button></div>
         </div>
       </aside>
 
@@ -1298,7 +1470,41 @@ const filteredAllocations = allocations.filter((allocation) => {
                   <p>
                     {Math.max(0, Number(selected.quantity || 0) - Number(selected.allocatedQuantity || 0))} units still needed · {Number(selected.allocatedQuantity || 0)} allocated · {selected.location} · {selected.category}
                   </p>
-                  <p>Status: {selected.status} · Recommendations use transparent rules, not a machine-learning prediction.</p>
+                  
+<p>Status: {selected.status}</p>
+
+<div
+  className={`matching-status ${
+    aiMatchingUsed === true
+      ? "matching-status-ai"
+      : aiMatchingUsed === false
+        ? "matching-status-rules"
+        : "matching-status-loading"
+  }`}
+>
+  <BrainCircuit size={17} />
+  <div>
+    <strong>
+      {aiMatchingUsed === true
+        ? "AI-enhanced matching"
+        : aiMatchingUsed === false
+          ? "Standard matching"
+          : "Checking matching method..."}
+    </strong>
+    <small>
+      {aiMatchingUsed === true
+        ? "The server reports that AI assistance was used to rank eligible resources."
+        : aiMatchingUsed === false
+          ? "The server reports that standard matching was used."
+          : "Waiting for the matching response."}
+    </small>
+  </div>
+</div>
+
+
+
+
+
                 </div>
 
                 {matches.length === 0 ? (
@@ -1434,6 +1640,16 @@ const recommendation =
                             </span>
                           ))}
                         </div>
+
+                        {(match.aiReason || match.aiExplanation) && (
+                          <div className="ai-match-reason">
+                            <BrainCircuit size={17} />
+                            <div>
+                              <strong>AI recommendation</strong>
+                              <p>{match.aiReason || match.aiExplanation}</p>
+                            </div>
+                          </div>
+                        )}
 
                         <div className="allocation-action">
                           <label className="allocation-quantity">
@@ -1945,6 +2161,130 @@ disabled={
                 }
               />
             </Field>
+
+            
+{showForm === "request" && (
+  <section className="ai-analysis-panel">
+    <div className="ai-analysis-heading">
+      <span className="ai-analysis-icon">
+        <BrainCircuit size={21} />
+      </span>
+      <div>
+        <h3>AI Need Analysis</h3>
+        <p>
+          Analyze the request for suggested category, urgency,
+          and recommended actions.
+        </p>
+      </div>
+    </div>
+
+    <button
+      type="button"
+      className="btn primary ai-analyze-button"
+      onClick={analyzeNeedWithAI}
+      disabled={aiLoading || busy}
+    >
+      <Sparkles size={17} />
+      {aiLoading ? "Analyzing request..." : "Analyze with AI"}
+    </button>
+
+    {aiLoading && (
+      <p className="ai-analysis-loading">
+        <RefreshCw size={16} />
+        Reviewing the need and preparing recommendations...
+      </p>
+    )}
+
+    {aiAnalysis && (
+      <div className="ai-analysis-result">
+        <div className="ai-analysis-result-heading">
+          <CheckCircle2 size={19} />
+          <h4>Analysis and recommendations</h4>
+        </div>
+
+        <div className="ai-suggestion-grid">
+          {aiAnalysis.suggestedCategory && (
+            <div className="ai-suggestion">
+              <span>Suggested category</span>
+              <strong>{aiAnalysis.suggestedCategory}</strong>
+            </div>
+          )}
+
+          {aiAnalysis.suggestedUrgency && (
+            <div className="ai-suggestion">
+              <span>Suggested urgency</span>
+              <strong>{aiAnalysis.suggestedUrgency}</strong>
+            </div>
+          )}
+        </div>
+
+        {(aiAnalysis.summary || aiAnalysis.needSummary ||
+          aiAnalysis.analysis || aiAnalysis.reason) && (
+          <div className="ai-analysis-copy">
+            <strong>Need summary and reasoning</strong>
+            <p>
+              {aiAnalysis.summary || aiAnalysis.needSummary ||
+                aiAnalysis.analysis || aiAnalysis.reason}
+            </p>
+          </div>
+        )}
+
+        {(aiAnalysis.suggestedActions || aiAnalysis.recommendations ||
+          aiAnalysis.recommendedActions) && (
+          <div className="ai-analysis-copy">
+            <strong>Recommended actions</strong>
+            {Array.isArray(
+              aiAnalysis.suggestedActions || aiAnalysis.recommendations ||
+              aiAnalysis.recommendedActions
+            ) ? (
+              <ul>
+                {(aiAnalysis.suggestedActions || aiAnalysis.recommendations ||
+                  aiAnalysis.recommendedActions).map((item, index) => (
+                  <li key={`${index}-${String(item)}`}>
+                    {typeof item === "string"
+                      ? item
+                      : item.title || item.description || JSON.stringify(item)}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>
+                {String(aiAnalysis.suggestedActions || aiAnalysis.recommendations ||
+                  aiAnalysis.recommendedActions)}
+              </p>
+            )}
+          </div>
+        )}
+
+        {(aiAnalysis.missingInformation || aiAnalysis.missingDetails) && (
+          <div className="ai-analysis-copy">
+            <strong>Information to check</strong>
+            <p>
+              {Array.isArray(aiAnalysis.missingInformation || aiAnalysis.missingDetails)
+                ? (aiAnalysis.missingInformation || aiAnalysis.missingDetails).join(", ")
+                : String(aiAnalysis.missingInformation || aiAnalysis.missingDetails)}
+            </p>
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="btn primary"
+          onClick={applyAIRecommendations}
+        >
+          <CheckCircle2 size={16} />
+          Apply AI suggestions
+        </button>
+
+        <p className="ai-analysis-disclaimer">
+          Review AI suggestions before submitting. They do not
+          replace human verification of community needs.
+        </p>
+      </div>
+    )}
+  </section>
+)}
+
 
             <button
               type="submit"

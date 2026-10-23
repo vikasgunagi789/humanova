@@ -137,6 +137,202 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+
+// Register a new user
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const name = String(req.body.name || req.body.fullName || "").trim();
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = req.body.password;
+
+    if (!name || !email || typeof password !== "string") {
+      return res.status(400).json({
+        message: "Name, email, and password are required."
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        message: "Enter a valid email address."
+      });
+    }
+
+    if (password.length < 8 || password.length > 128) {
+      return res.status(400).json({
+        message: "Password must be between 8 and 128 characters."
+      });
+    }
+
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+      return res.status(500).json({
+        message: "Authentication is not configured correctly."
+      });
+    }
+
+    const users = db.collection("users");
+    const existing = await users
+      .where("email", "==", email)
+      .limit(1)
+      .get();
+
+    if (!existing.empty) {
+      return res.status(409).json({
+        message: "An account with this email already exists."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const userRef = users.doc();
+
+    await userRef.create({
+      name,
+      email,
+      passwordHash,
+      role: "user",
+      createdAt: new Date()
+    });
+
+    const token = jwt.sign(
+      { sub: userRef.id, email, role: "user" },
+      process.env.JWT_SECRET,
+      { expiresIn: "2h" }
+    );
+
+    return res.status(201).json({
+      message: "Account created successfully.",
+      token,
+      user: { id: userRef.id, name, email, role: "user" }
+    });
+  } catch (error) {
+    console.error("Registration failed:", error.message);
+    return res.status(500).json({
+      message: "Unable to create your account right now."
+    });
+  }
+});
+
+// Login an existing user
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = req.body.password;
+
+    if (!email || typeof password !== "string") {
+      return res.status(400).json({
+        message: "Email and password are required."
+      });
+    }
+
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+      return res.status(500).json({
+        message: "Authentication is not configured correctly."
+      });
+    }
+
+    const snapshot = await db.collection("users")
+      .where("email", "==", email)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(401).json({
+        message: "Invalid email or password."
+      });
+    }
+
+    const doc = snapshot.docs[0];
+    const user = doc.data();
+    const validPassword = await bcrypt.compare(
+      password,
+      user.passwordHash
+    );
+
+    if (!validPassword) {
+      return res.status(401).json({
+        message: "Invalid email or password."
+      });
+    }
+
+    const token = jwt.sign(
+      { sub: doc.id, email: user.email, role: user.role || "user" },
+      process.env.JWT_SECRET,
+      { expiresIn: "2h" }
+    );
+
+    return res.json({
+      message: "Login successful.",
+      token,
+      user: {
+        id: doc.id,
+        name: user.name,
+        email: user.email,
+        role: user.role || "user"
+      }
+    });
+  } catch (error) {
+    console.error("Login failed:", error.message);
+    return res.status(500).json({
+      message: "Unable to log in right now."
+    });
+  }
+});
+
+// Get the currently logged-in user
+app.get("/api/auth/me", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token is required",
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    const userId = decoded.sub;
+
+if (!userId) {
+  return res.status(401).json({
+    success: false,
+    message: "Invalid authentication token",
+  });
+}
+
+const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const user = userDoc.data();
+
+    return res.json({
+      success: true,
+      user: {
+        id: userDoc.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired authentication token",
+    });
+  }
+});
+
+
 // Dashboard
 app.get("/api/dashboard", async (req, res, next) => {
   try {
@@ -322,6 +518,365 @@ app.get("/api/matches/:requestId", async (req, res, next) => {
     next(error);
   }
 });
+
+// AI-assisted Smart Matching.
+// Place after GET /api/matches/:requestId.
+// Keep the existing matching endpoint unchanged.
+
+app.get("/api/ai/matches/:requestId", async (req, res) => {
+  try {
+    const request = await getById("requests", req.params.requestId);
+
+    if (!request) {
+      return res.status(404).json({ message: "Request not found." });
+    }
+
+    const resources = await getAll("resources");
+    const baseMatches = calculateMatches(request, resources);
+
+    // Only resources already approved by the existing rules
+    // are candidates for AI ranking.
+    if (!baseMatches.length) {
+      return res.json({
+        request,
+        matches: [],
+        aiEnhanced: false,
+        message: "No eligible resources currently match this request."
+      });
+    }
+
+    // Fall back to normal matching if AI is not configured.
+    if (!process.env.GROQ_API_KEY) {
+      return res.json({
+        request,
+        matches: baseMatches,
+        aiEnhanced: false
+      });
+    }
+
+    const getResourceId = (match) =>
+      String(
+        match.resource?.id ??
+        match.resource?._id ??
+        match.resource?.resourceId ??
+        ""
+      );
+
+    const candidates = baseMatches.map((match) => ({
+      resourceId: getResourceId(match),
+      name: match.resource?.name || match.resource?.title || "Unnamed resource",
+      category: match.resource?.category || "",
+      location: match.resource?.location || "",
+      availableQuantity: match.availableQuantity,
+      suggestedQuantity: match.suggestedQuantity,
+      score: match.score,
+      reasons: match.reasons || []
+    }));
+
+    // Do not ask AI to rank candidates without stable IDs.
+    if (candidates.some((item) => !item.resourceId)) {
+      return res.json({
+        request,
+        matches: baseMatches,
+        aiEnhanced: false
+      });
+    }
+
+    const response = await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: "openai/gpt-oss-120b",
+          temperature: 0.1,
+          max_tokens: 1000,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: `You rank eligible community resources for a request.
+Return valid JSON: {"rankedMatches":[{"resourceId":"exact ID","reason":"short explanation"}]}.
+Only use the supplied candidates and their IDs. Do not invent stock,
+distance, expiry, delivery times, or availability. Consider urgency,
+location, quantity fit, and the supplied rule-based reasons.
+Do not change quantities or allocate resources.`
+            },
+            {
+              role: "user",
+              content: JSON.stringify({
+                request: {
+                  title: request.title,
+                  description: request.description || "",
+                  category: request.category,
+                  quantity: request.quantity,
+                  allocatedQuantity: request.allocatedQuantity || 0,
+                  urgency: request.urgency,
+                  location: request.location
+                },
+                candidates
+              })
+            }
+          ]
+        })
+      }
+    );
+
+    if (!response.ok) {
+      console.error("AI matching provider status:", response.status);
+
+      return res.json({
+        request,
+        matches: baseMatches,
+        aiEnhanced: false
+      });
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+
+    if (!content) {
+      return res.json({
+        request,
+        matches: baseMatches,
+        aiEnhanced: false
+      });
+    }
+
+    const parsed = JSON.parse(content);
+    const rankedMatches = Array.isArray(parsed.rankedMatches)
+      ? parsed.rankedMatches
+      : [];
+
+    const allowedIds = new Set(candidates.map((item) => item.resourceId));
+    const rankMap = new Map();
+
+    for (const item of rankedMatches) {
+      if (
+        item &&
+        allowedIds.has(String(item.resourceId)) &&
+        typeof item.reason === "string" &&
+        !rankMap.has(String(item.resourceId))
+      ) {
+        rankMap.set(String(item.resourceId), item.reason.slice(0, 400));
+      }
+    }
+
+    // Only reorder real, rule-approved matches.
+    // Unranked matches remain available at the end.
+    const enrichedMatches = [...baseMatches].sort((a, b) => {
+      const aId = getResourceId(a);
+      const bId = getResourceId(b);
+      return (
+        (rankMap.has(bId) ? 1 : 0) -
+        (rankMap.has(aId) ? 1 : 0)
+      );
+    }).map((match) => ({
+      ...match,
+      aiReason: rankMap.get(getResourceId(match)) || null
+    }));
+
+    return res.json({
+      request,
+      matches: enrichedMatches,
+      aiEnhanced: rankMap.size > 0
+    });
+  } catch (error) {
+    console.error("AI Smart Matching failed:", error.message);
+
+    // Preserve functionality if AI fails.
+    try {
+      const request = await getById("requests", req.params.requestId);
+      if (!request) {
+        return res.status(404).json({ message: "Request not found." });
+      }
+
+      const resources = await getAll("resources");
+
+      return res.json({
+        request,
+        matches: calculateMatches(request, resources),
+        aiEnhanced: false
+      });
+    } catch (fallbackError) {
+      console.error("Smart Matching fallback failed:", fallbackError.message);
+      return res.status(500).json({
+        message: "Unable to load resource matches."
+      });
+    }
+  }
+});
+
+
+app.post("/api/ai/analyze-need", async (req, res) => {
+  try {
+    const { title, description, category, quantity, location } = req.body;
+
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(503).json({
+        message: "AI is not configured. Add GROQ_API_KEY to server/.env."
+      });
+    }
+
+    if (
+      typeof title !== "string" ||
+      !title.trim() ||
+      title.length > 100 ||
+      (description != null &&
+        (typeof description !== "string" || description.length > 500))
+    ) {
+      return res.status(400).json({
+        message: "Enter a valid title and description."
+      });
+    }
+
+    const validCategories = [
+      "Food",
+      "Clothing",
+      "Education",
+      "Medical",
+      "Shelter",
+      "Transport",
+      "Volunteers",
+      "Other"
+    ];
+
+    const validUrgencies = ["Low", "Medium", "High", "Critical"];
+
+    const response = await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: "openai/gpt-oss-120b",
+          temperature: 0.2,
+          max_tokens: 700,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: `You are Humanova's community needs analysis engine.
+
+Analyze the submitted request and return valid JSON with:
+{
+  "summary": "Short summary of the need",
+  "suggestedCategory": "One valid category",
+  "suggestedUrgency": "Low, Medium, High, or Critical",
+  "reason": "Evidence-based explanation",
+  "missingInformation": ["Questions that need clarification"],
+  "suggestedActions": ["Practical next steps"]
+}
+
+Valid categories: ${validCategories.join(", ")}.
+Valid urgency levels: ${validUrgencies.join(", ")}.
+
+Never invent facts or claim that resources are available.
+Use Critical only when the supplied details indicate an
+immediate, serious need. If evidence is insufficient,
+choose a cautious recommendation and explain uncertainty.
+Suggestions must be reviewed by a human.
+Do not change database records or allocate resources.`
+            },
+            {
+              role: "user",
+              content: JSON.stringify({
+                title: title.trim(),
+                description: description || "",
+                category: category || "Other",
+                quantity: quantity ?? null,
+                location: location || "Not provided"
+              })
+            }
+          ]
+        })
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+  console.error("Groq API error:", {
+    status: response.status,
+    message: data.error?.message || "No error details returned"
+  });
+
+  let message = "AI analysis failed. Please try again.";
+
+  if (response.status === 401) {
+    message = "Groq API key is invalid. Check server/.env.";
+  } else if (response.status === 403) {
+    message = "Groq denied access. Check your model permissions.";
+  } else if (response.status === 429) {
+    message = "Groq rate limit or quota reached. Try again later.";
+  } else if (response.status === 400 || response.status === 404) {
+    message = "Groq rejected the model or request configuration.";
+  }
+
+  return res.status(502).json({ message });
+}
+
+    const content = data.choices?.[0]?.message?.content;
+
+    if (!content) {
+      return res.status(502).json({
+        message: "The AI returned an empty response."
+      });
+    }
+
+    let analysis;
+
+    try {
+      analysis = JSON.parse(content);
+    } catch {
+      return res.status(502).json({
+        message: "The AI returned an invalid response."
+      });
+    }
+
+    if (
+      typeof analysis.summary !== "string" ||
+      !validCategories.includes(analysis.suggestedCategory) ||
+      !validUrgencies.includes(analysis.suggestedUrgency) ||
+      typeof analysis.reason !== "string" ||
+      !Array.isArray(analysis.missingInformation) ||
+      !Array.isArray(analysis.suggestedActions)
+    ) {
+      return res.status(502).json({
+        message: "The AI response failed validation."
+      });
+    }
+
+    res.json({
+      success: true,
+      analysis: {
+        summary: analysis.summary,
+        suggestedCategory: analysis.suggestedCategory,
+        suggestedUrgency: analysis.suggestedUrgency,
+        reason: analysis.reason,
+        missingInformation: analysis.missingInformation
+          .filter(item => typeof item === "string")
+          .slice(0, 6),
+        suggestedActions: analysis.suggestedActions
+          .filter(item => typeof item === "string")
+          .slice(0, 6)
+      }
+    });
+  } catch (error) {
+    console.error("Humanova AI analysis failed:", error.message);
+
+    res.status(500).json({
+      message: "Unable to analyze this request right now."
+    });
+  }
+});
+
 
 // Update request status
 app.patch("/api/requests/:id/status", async (req, res, next) => {
