@@ -4,15 +4,18 @@ import {
   Activity,
   ArrowRight,
   BrainCircuit,
+  CalendarDays,
   CheckCircle2,
   Clock3,
   HandHeart,
+  History,
   HeartHandshake,
   LayoutDashboard,
   MapPin,
   Package,
   Plus,
   RefreshCw,
+    Search,
   ShieldCheck,
   Sparkles,
   TriangleAlert,
@@ -131,6 +134,10 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [allocations, setAllocations] = useState([]);
+const [allocationSearch, setAllocationSearch] = useState("");
+const [allocationStatusFilter, setAllocationStatusFilter] =
+  useState("All");
 
   const [form, setForm] = useState(EMPTY_FORM);
 
