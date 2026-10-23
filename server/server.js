@@ -1,973 +1,775 @@
 
 const express = require("express");
-const mongoose = require("mongoose");
 const cors = require("cors");
 require("dotenv").config();
 
+const {
+  db,
+  collections,
+  getAll,
+  getById,
+  create
+} = require("./firestoreStore");
+
 const app = express();
+const PORT = process.env.PORT || 5000;
+
 app.use(cors());
 app.use(express.json());
 
 const categories = [
-  "Food", "Clothing", "Education", "Medical",
-  "Shelter", "Transport", "Volunteers", "Other"
+  "Food",
+  "Clothing",
+  "Education",
+  "Medical",
+  "Shelter",
+  "Transport",
+  "Volunteers",
+  "Other"
 ];
 
 const urgencyLevels = ["Low", "Medium", "High", "Critical"];
-const statuses = ["Open", "Matched", "Accepted", "Fulfilled"];
+const requestStatuses = ["Open", "Matched", "Accepted", "Fulfilled"];
 
-const requestSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  description: { type: String, default: "" },
-  category: { type: String, enum: categories, required: true },
-  quantity: { type: Number, min: 1, required: true },
-  location: { type: String, required: true },
-  urgency: { type: String, enum: urgencyLevels, default: "Medium" },
-  status: { type: String, enum: statuses, default: "Open" },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const allocationSchema = new mongoose.Schema({
-  requestId: {
-    type: String,
-    required: true,
-    index: true
-  },
-  resourceId: {
-    type: String,
-    required: true,
-    index: true
-  },
-  requestTitle: {
-    type: String,
-    default: ""
-  },
-  resourceTitle: {
-    type: String,
-    default: ""
-  },
-  quantity: {
-    type: Number,
-    required: true,
-    min: 1
-  },
-  location: {
-    type: String,
-    default: ""
-  },
-  status: {
-    type: String,
-    enum: ["Reserved", "Delivered", "Cancelled"],
-    default: "Reserved"
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now
-  }
-});
-
-const Allocation = mongoose.model(
-  "Allocation",
-  allocationSchema
-);
-
-const resourceSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  description: { type: String, default: "" },
-  category: { type: String, enum: categories, required: true },
-  quantity: { type: Number, min: 1, required: true },
-  location: { type: String, required: true },
-  availableUntil: { type: Date, default: null },
-  createdAt: { type: Date, default: Date.now }
-});
-
-let allocations = [];
-const Request = mongoose.model("Request", requestSchema);
-const Resource = mongoose.model("Resource", resourceSchema);
-
-// Demo mode works without a MongoDB connection.
-let useMongo = false;
-let requests = [];
-let resources = [];
-
-function cleanText(value, max = 180) {
-  return typeof value === "string" ? value.trim().slice(0, max) : "";
+function cleanString(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function validateItem(body, isRequest) {
-  const title = cleanText(body.title, 100);
-  const location = cleanText(body.location, 100);
-  const category = body.category;
-  const quantity = Number(body.quantity);
-
-  if (!title || !location || !categories.includes(category)) {
-    return "Title, valid category, and location are required.";
-  }
-
-  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100000) {
-    return "Quantity must be a positive whole number.";
-  }
-
-  if (isRequest && !urgencyLevels.includes(body.urgency || "Medium")) {
-    return "Invalid urgency level.";
-  }
-
-  return null;
+function validQuantity(value) {
+  return Number.isSafeInteger(value) && value > 0;
 }
 
-async function allRequests() {
-  return useMongo
-    ? Request.find().sort({ createdAt: -1 }).lean()
-    : requests;
-}
+function timestampMillis(value) {
+  if (!value) return null;
 
-async function allResources() {
-  return useMongo
-    ? Resource.find().sort({ createdAt: -1 }).lean()
-    : resources;
-}
-
-async function findRequest(id) {
-  if (useMongo) {
-    if (!mongoose.isValidObjectId(id)) return null;
-    return Request.findById(id);
-  }
-  return requests.find(item => item._id === id) || null;
-}
-
-async function updateRequest(id, updates) {
-  if (useMongo) {
-    if (!mongoose.isValidObjectId(id)) return null;
-    return Request.findByIdAndUpdate(id, updates, {
-      new: true,
-      runValidators: true
-    });
+  if (typeof value.toMillis === "function") {
+    return value.toMillis();
   }
 
-  const item = requests.find(item => item._id === id);
-  if (!item) return null;
-  Object.assign(item, updates);
-  return item;
+  const result = new Date(value).getTime();
+  return Number.isFinite(result) ? result : null;
 }
 
-const urgencyScore = {
-  Low: 25,
-  Medium: 50,
-  High: 75,
-  Critical: 100
-};
+function isExpired(resource) {
+  if (!resource.availableUntil) return false;
 
-function calculateMatches(request, availableResources) {
-  return availableResources
+  const expiry = timestampMillis(resource.availableUntil);
+  return expiry !== null && expiry < Date.now();
+}
+
+function availableStock(resource) {
+  return Math.max(0, Number(resource.quantity) || 0);
+}
+
+function remainingNeed(request) {
+  return Math.max(
+    0,
+    (Number(request.quantity) || 0) -
+    (Number(request.allocatedQuantity) || 0)
+  );
+}
+
+function calculateMatches(request, resources) {
+  return resources
     .filter(resource => {
-      const open = request.status === "Open";
-      const correctCategory = resource.category === request.category;
-      const enoughQuantity = resource.quantity > 0;
-      return open && correctCategory && enoughQuantity;
+      return (
+        resource.category === request.category &&
+        availableStock(resource) > 0 &&
+        !isExpired(resource)
+      );
     })
     .map(resource => {
-      const sameLocation =
-        resource.location.trim().toLowerCase() ===
-        request.location.trim().toLowerCase();
+      let score = 50;
 
-      const quantityRatio = Math.min(
-        resource.quantity / request.quantity, 1
-      );
+      if (
+        cleanString(resource.location).toLowerCase() ===
+        cleanString(request.location).toLowerCase()
+      ) {
+        score += 30;
+      }
 
-      const score = Math.round(
-        40 +
-        (sameLocation ? 25 : 0) +
-        urgencyScore[request.urgency] * 0.20 +
-        quantityRatio * 15
-      );
-
-      const reasons = [
-        "Same resource category",
-        sameLocation ? "Same locality" : "Different locality",
-        resource.quantity >= request.quantity
-          ? "Quantity is sufficient"
-          : "Partial quantity available",
-        `${request.urgency} urgency considered`
-      ];
+      if (availableStock(resource) >= remainingNeed(request)) {
+        score += 20;
+      } else {
+        score += Math.round(
+          20 * availableStock(resource) /
+          Math.max(1, remainingNeed(request))
+        );
+      }
 
       return {
-        resource,
-        score: Math.min(score, 100),
-        reasons
+        ...resource,
+        availableQuantity: availableStock(resource),
+        matchScore: Math.min(100, score)
       };
     })
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.matchScore - a.matchScore);
 }
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    database: useMongo ? "MongoDB" : "Demo memory mode"
-  });
+// Health check
+app.get("/api/health", async (req, res) => {
+  try {
+    await db.collection("requests").limit(1).get();
+
+    res.json({
+      status: "ok",
+      database: "Firestore",
+      message: "Humanova API and Firestore are connected."
+    });
+  } catch (error) {
+    console.error("Health check failed:", error.message);
+
+    res.status(503).json({
+      status: "error",
+      database: "Firestore",
+      message: "Firestore is unavailable."
+    });
+  }
 });
 
+// Dashboard
 app.get("/api/dashboard", async (req, res, next) => {
   try {
-    const [rs, inventory] = await Promise.all([
-      allRequests(), allResources()
+    const [requests, resources, allocations] = await Promise.all([
+      getAll("requests"),
+      getAll("resources"),
+      getAll("allocations")
     ]);
 
     res.json({
-      totalRequests: rs.length,
-      openRequests: rs.filter(r => r.status === "Open").length,
-      fulfilled: rs.filter(r => r.status === "Fulfilled").length,
-      availableResources: inventory.reduce(
-        (sum, r) => sum + r.quantity, 0
-      ),
-      urgentRequests: rs.filter(
-        r => ["High", "Critical"].includes(r.urgency) &&
-          r.status !== "Fulfilled"
-      ).length
+      totalRequests: requests.length,
+      openRequests: requests.filter(
+        item => item.status === "Open"
+      ).length,
+      matchedRequests: requests.filter(
+        item => item.status === "Matched"
+      ).length,
+      fulfilledRequests: requests.filter(
+        item => item.status === "Fulfilled"
+      ).length,
+      totalResources: resources.length,
+      availableResources: resources.filter(
+        item => availableStock(item) > 0 && !isExpired(item)
+      ).length,
+      totalAllocations: allocations.length,
+      requests,
+      resources,
+      allocations
     });
-  } catch (err) {
-    next(err);
+  } catch (error) {
+    next(error);
   }
 });
 
+// Get all requests
 app.get("/api/requests", async (req, res, next) => {
   try {
-    res.json(await allRequests());
-  } catch (err) {
-    next(err);
+    res.json(await getAll("requests"));
+  } catch (error) {
+    next(error);
   }
 });
 
+// Create a request
 app.post("/api/requests", async (req, res, next) => {
   try {
-    const error = validateItem(req.body, true);
-    if (error) return res.status(400).json({ error });
-
-    const item = {
-      title: cleanText(req.body.title, 100),
-      description: cleanText(req.body.description, 500),
-      category: req.body.category,
-      quantity: Number(req.body.quantity),
-      location: cleanText(req.body.location, 100),
-      urgency: req.body.urgency || "Medium",
-      status: "Open",
-      createdAt: new Date()
-    };
-
-    const saved = useMongo
-      ? await Request.create(item)
-      : { ...item, _id: require("crypto").randomUUID() };
-
-    if (!useMongo) requests.unshift(saved);
-    res.status(201).json(saved);
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get("/api/resources", async (req, res, next) => {
-  try {
-    res.json(await allResources());
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/api/resources", async (req, res, next) => {
-  try {
-    const error = validateItem(req.body, false);
-    if (error) return res.status(400).json({ error });
-
-    const item = {
-      title: cleanText(req.body.title, 100),
-      description: cleanText(req.body.description, 500),
-      category: req.body.category,
-      quantity: Number(req.body.quantity),
-      location: cleanText(req.body.location, 100),
-      createdAt: new Date()
-    };
-
-    const saved = useMongo
-      ? await Resource.create(item)
-      : { ...item, _id: require("crypto").randomUUID() };
-
-    if (!useMongo) resources.unshift(saved);
-    res.status(201).json(saved);
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get("/api/matches/:requestId", async (req, res, next) => {
-  try {
-    const request = await findRequest(req.params.requestId);
-    if (!request) {
-      return res.status(404).json({ error: "Request not found." });
-    }
-
-    const inventory = await allResources();
-    res.json({
-      request,
-      matches: calculateMatches(request, inventory)
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.patch("/api/requests/:id/status", async (req, res, next) => {
-  try {
-    const allowedTransitions = {
-      Open: ["Matched"],
-      Matched: ["Accepted", "Open"],
-      Accepted: ["Fulfilled", "Open"],
-      Fulfilled: []
-    };
-
-    const request = await findRequest(req.params.id);
-    if (!request) {
-      return res.status(404).json({ error: "Request not found." });
-    }
-
-    const nextStatus = req.body.status;
-    if (!statuses.includes(nextStatus) ||
-        !allowedTransitions[request.status].includes(nextStatus)) {
-      return res.status(400).json({
-        error: `Cannot change ${request.status} to ${nextStatus}.`
-      });
-    }
-
-    const updated = await updateRequest(req.params.id, {
-      status: nextStatus
-    });
-
-    res.json(updated);
-  } catch (err) {
-    next(err);
-  }
-});
-
-
-app.post("/api/allocations", async (req, res, next) => {
-  let reservedResourceId = null;
-  let reservedRequestId = null;
-  let reservedQuantity = 0;
-
-  try {
-    const { requestId, resourceId } = req.body;
+    const title = cleanString(req.body.title);
+    const category = cleanString(req.body.category);
+    const location = cleanString(req.body.location);
+    const description = cleanString(req.body.description);
+    const urgency = req.body.urgency || "Medium";
     const quantity = Number(req.body.quantity);
 
-    if (
-      typeof requestId !== "string" ||
-      typeof resourceId !== "string" ||
-      !requestId.trim() ||
-      !resourceId.trim() ||
-      !Number.isSafeInteger(quantity) ||
-      quantity < 1
-    ) {
+    if (!title || !location || !category) {
       return res.status(400).json({
-        error: "Valid requestId, resourceId and positive whole quantity are required."
+        message: "Title, category, and location are required."
       });
     }
 
-    const request = await findRequest(requestId);
+    if (!categories.includes(category)) {
+      return res.status(400).json({
+        message: "Invalid category."
+      });
+    }
+
+    if (!urgencyLevels.includes(urgency)) {
+      return res.status(400).json({
+        message: "Invalid urgency level."
+      });
+    }
+
+    if (!validQuantity(quantity)) {
+      return res.status(400).json({
+        message: "Quantity must be a positive whole number."
+      });
+    }
+
+    const request = await create("requests", {
+      title,
+      description,
+      category,
+      quantity,
+      allocatedQuantity: 0,
+      location,
+      urgency,
+      status: "Open"
+    });
+
+    res.status(201).json(request);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get all resources
+app.get("/api/resources", async (req, res, next) => {
+  try {
+    res.json(await getAll("resources"));
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Create a resource
+app.post("/api/resources", async (req, res, next) => {
+  try {
+    const title = cleanString(req.body.title);
+    const category = cleanString(req.body.category);
+    const location = cleanString(req.body.location);
+    const description = cleanString(req.body.description);
+    const quantity = Number(req.body.quantity);
+
+    if (!title || !category || !location) {
+      return res.status(400).json({
+        message: "Title, category, and location are required."
+      });
+    }
+
+    if (!categories.includes(category)) {
+      return res.status(400).json({
+        message: "Invalid category."
+      });
+    }
+
+    if (!validQuantity(quantity)) {
+      return res.status(400).json({
+        message: "Quantity must be a positive whole number."
+      });
+    }
+
+    let availableUntil = null;
+
+    if (req.body.availableUntil) {
+      const expiry = new Date(req.body.availableUntil);
+
+      if (Number.isNaN(expiry.getTime())) {
+        return res.status(400).json({
+          message: "Invalid availableUntil date."
+        });
+      }
+
+      availableUntil = expiry;
+    }
+
+    const resource = await create("resources", {
+      title,
+      description,
+      category,
+      quantity,
+      location,
+      availableUntil
+    });
+
+    res.status(201).json(resource);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Find matching resources for a request
+app.get("/api/matches/:requestId", async (req, res, next) => {
+  try {
+    const request = await getById(
+      "requests",
+      req.params.requestId
+    );
 
     if (!request) {
       return res.status(404).json({
-        error: "Community request not found."
+        message: "Request not found."
       });
     }
 
-    if (request.status === "Fulfilled") {
-      return res.status(409).json({
-        error: "This request is already fulfilled."
-      });
-    }
+    const resources = await getAll("resources");
+    const matches = calculateMatches(request, resources);
 
-    if (request.status === "Accepted") {
-      return res.status(409).json({
-        error: "This request is already accepted for fulfillment."
-      });
-    }
-
-    const resource = useMongo
-      ? await Resource.findById(resourceId).lean()
-      : resources.find(
-          item => item._id === resourceId
-        );
-
-    if (!resource) {
-      return res.status(404).json({
-        error: "Resource not found."
-      });
-    }
-
-    if (resource.category !== request.category) {
-      return res.status(400).json({
-        error: "Resource category does not match the request."
-      });
-    }
-
-    const alreadyAllocated = Math.max(
-      0,
-      Number(request.allocatedQuantity) || 0
-    );
-
-    const remainingNeed =
-      Number(request.quantity) - alreadyAllocated;
-
-    if (quantity > remainingNeed) {
-      return res.status(400).json({
-        error: "Allocation exceeds the remaining request quantity.",
-        remainingNeed
-      });
-    }
-
-    if (useMongo) {
-      if (
-        !mongoose.isValidObjectId(requestId) ||
-        !mongoose.isValidObjectId(resourceId)
-      ) {
-        return res.status(400).json({
-          error: "Invalid database ID."
-        });
-      }
-
-      // Atomically reserve stock so concurrent requests
-      // cannot reserve the same available quantity.
-      const stock = await Resource.findOneAndUpdate(
-        {
-          _id: resourceId,
-          category: request.category,
-          quantity: { $gte: quantity },
-          $or: [
-            { availableUntil: null },
-            { availableUntil: { $exists: false } },
-            { availableUntil: { $gte: new Date() } }
-          ]
-        },
-        {
-          $inc: { quantity: -quantity }
-        },
-        { new: true }
-      );
-
-      if (!stock) {
-        return res.status(409).json({
-          error: "Insufficient stock or resource is expired."
-        });
-      }
-
-      reservedResourceId = resourceId;
-      reservedRequestId = requestId;
-      reservedQuantity = quantity;
-
-      // Update only if sufficient need remains.
-      const updatedRequest = await Request.findOneAndUpdate(
-        {
-          _id: requestId,
-          quantity: {
-            $gte: alreadyAllocated + quantity
-          },
-          allocatedQuantity: alreadyAllocated,
-          status: { $in: ["Open", "Matched"] }
-        },
-        {
-          $inc: { allocatedQuantity: quantity }
-        },
-        { new: true }
-      );
-
-      if (!updatedRequest) {
-        await Resource.updateOne(
-          { _id: resourceId },
-          { $inc: { quantity } }
-        );
-
-        reservedResourceId = null;
-
-        return res.status(409).json({
-          error: "Request changed during allocation. Please retry."
-        });
-      }
-
-      const complete =
-        updatedRequest.allocatedQuantity >= updatedRequest.quantity;
-
-      if (complete) {
-        updatedRequest.status = "Matched";
-        await updatedRequest.save();
-      }
-
-      const allocation = await Allocation.create({
-        requestId,
-        resourceId,
-        requestTitle: request.title,
-        resourceTitle: resource.title,
-        quantity,
-        location: resource.location,
-        status: "Reserved"
-      });
-
-      reservedResourceId = null;
-
-      return res.status(201).json({
-        success: true,
-        message: "Resource allocated successfully.",
-        allocation,
-        remainingNeed:
-          updatedRequest.quantity -
-          updatedRequest.allocatedQuantity,
-        remainingStock: stock.quantity
-      });
-    }
-
-    // Demo mode: update the in-memory objects.
-    const currentResourceQuantity =
-      Number(resource.quantity) || 0;
-
-    if (currentResourceQuantity < quantity) {
-      return res.status(409).json({
-        error: "Insufficient resource stock."
-      });
-    }
-
-    const currentRequestQuantity =
-      Number(request.allocatedQuantity) || 0;
-
-    if (
-      currentRequestQuantity + quantity >
-      Number(request.quantity)
-    ) {
-      return res.status(409).json({
-        error: "Request quantity has changed. Please retry."
-      });
-    }
-
-    resource.quantity -= quantity;
-    request.allocatedQuantity =
-      currentRequestQuantity + quantity;
-
-    if (request.allocatedQuantity >= request.quantity) {
-      request.status = "Matched";
-    }
-
-    const allocation = {
-      _id: require("crypto").randomUUID(),
-      requestId,
-      resourceId,
-      requestTitle: request.title,
-      resourceTitle: resource.title,
-      quantity,
-      location: resource.location,
-      status: "Reserved",
-      createdAt: new Date()
-    };
-
-    allocations.unshift(allocation);
-
-    return res.status(201).json({
-      success: true,
-      message: "Resource allocated successfully.",
-      allocation,
-      remainingNeed:
-        request.quantity - request.allocatedQuantity,
-      remainingStock: resource.quantity
+    res.json({
+      request,
+      remainingNeed: remainingNeed(request),
+      matches
     });
   } catch (error) {
-    // Best-effort compensation if a later database operation fails.
-    if (useMongo && reservedResourceId) {
-      try {
-        await Resource.updateOne(
-          { _id: reservedResourceId },
-          { $inc: { quantity: reservedQuantity } }
-        );
-
-        if (reservedRequestId) {
-          await Request.updateOne(
-            {
-              _id: reservedRequestId,
-              allocatedQuantity: { $gte: reservedQuantity }
-            },
-            { $inc: { allocatedQuantity: -reservedQuantity } }
-          );
-        }
-      } catch (rollbackError) {
-        console.error(
-          "Allocation rollback failed:",
-          rollbackError
-        );
-      }
-    }
-
     next(error);
   }
 });
 
-app.get("/api/allocations", async (req, res, next) => {
+// Update request status
+app.patch("/api/requests/:id/status", async (req, res, next) => {
   try {
-    const history = useMongo
-      ? await Allocation.find()
-          .sort({ createdAt: -1 })
-          .lean()
-      : allocations;
+    const status = cleanString(req.body.status);
 
-    res.json(history);
+    if (!requestStatuses.includes(status)) {
+      return res.status(400).json({
+        message: "Invalid request status."
+      });
+    }
+
+    const requestRef = collections.requests.doc(req.params.id);
+
+    const result = await db.runTransaction(async transaction => {
+      const snapshot = await transaction.get(requestRef);
+
+      if (!snapshot.exists) {
+        const error = new Error("Request not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const request = snapshot.data();
+
+      if (
+        status === "Fulfilled" &&
+        Number(request.allocatedQuantity || 0) <
+          Number(request.quantity || 0)
+      ) {
+        const error = new Error(
+          "A request cannot be marked fulfilled until its full quantity is allocated."
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+
+      transaction.update(requestRef, { status });
+
+      return {
+        ...request,
+        status,
+        _id: snapshot.id
+      };
+    });
+
+    res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: "Server error. Check backend logs." });
+// Allocate a resource to a request.
+// This is the ONLY allocation POST handler.
+app.post("/api/allocations", async (req, res, next) => {
+  try {
+    const requestId = cleanString(req.body.requestId);
+    const resourceId = cleanString(req.body.resourceId);
+    const quantity = Number(req.body.quantity);
+
+    if (!requestId || !resourceId) {
+      return res.status(400).json({
+        message: "requestId and resourceId are required."
+      });
+    }
+
+    if (!validQuantity(quantity)) {
+      return res.status(400).json({
+        message: "Allocation quantity must be a positive whole number."
+      });
+    }
+
+    const requestRef = collections.requests.doc(requestId);
+    const resourceRef = collections.resources.doc(resourceId);
+    const allocationRef = collections.allocations.doc();
+
+    const allocation = await db.runTransaction(
+      async transaction => {
+        // All reads must happen before any writes.
+        const [requestSnapshot, resourceSnapshot] =
+          await Promise.all([
+            transaction.get(requestRef),
+            transaction.get(resourceRef)
+          ]);
+
+        if (!requestSnapshot.exists) {
+          const error = new Error("Request not found.");
+          error.statusCode = 404;
+          throw error;
+        }
+
+        if (!resourceSnapshot.exists) {
+          const error = new Error("Resource not found.");
+          error.statusCode = 404;
+          throw error;
+        }
+
+        const request = requestSnapshot.data();
+        const resource = resourceSnapshot.data();
+
+        if (!["Open", "Matched"].includes(request.status)) {
+          const error = new Error(
+            "Only Open or Matched requests can receive allocations."
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        if (request.category !== resource.category) {
+          const error = new Error(
+            "Resource and request categories must match."
+          );
+          error.statusCode = 400;
+          throw error;
+        }
+
+        if (isExpired(resource)) {
+          const error = new Error(
+            "This resource has expired and cannot be allocated."
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        const stock = availableStock(resource);
+        const need = remainingNeed(request);
+
+        if (quantity > stock) {
+          const error = new Error(
+            `Insufficient stock. Available quantity: ${stock}.`
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        if (quantity > need) {
+          const error = new Error(
+            `Allocation exceeds remaining need. Remaining need: ${need}.`
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        const newStock = stock - quantity;
+        const newAllocated =
+          Number(request.allocatedQuantity || 0) + quantity;
+        const newStatus =
+          newAllocated >= Number(request.quantity)
+            ? "Matched"
+            : "Open";
+
+        const createdAt = new Date();
+
+        const allocationData = {
+          requestId,
+          resourceId,
+          requestTitle: request.title,
+          resourceTitle: resource.title,
+          quantity,
+          location: request.location || resource.location || "",
+          status: "Reserved",
+          createdAt
+        };
+
+        // The following writes commit together or not at all.
+        transaction.update(resourceRef, {
+          quantity: newStock
+        });
+
+        transaction.update(requestRef, {
+          allocatedQuantity: newAllocated,
+          status: newStatus
+        });
+
+        transaction.set(allocationRef, allocationData);
+
+        return {
+          ...allocationData,
+          _id: allocationRef.id,
+          remainingNeed: Number(request.quantity) - newAllocated,
+          remainingStock: newStock,
+          requestStatus: newStatus
+        };
+      }
+    );
+
+    res.status(201).json(allocation);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get all allocations
+app.get("/api/allocations", async (req, res, next) => {
+  try {
+    res.json(await getAll("allocations"));
+  } catch (error) {
+    next(error);
+  }
 });
 
 
-async function start() {
-  if (process.env.MONGO_URI) {
-    try {
-      await mongoose.connect(process.env.MONGO_URI, {
-        serverSelectionTimeoutMS: 5000
-      });
-      useMongo = true;
-      console.log("Connected to MongoDB");
-    } catch (err) {
-      console.error("MongoDB connection failed:", err.message);
-      console.log("Starting in temporary demo memory mode.");
-    }
-  }
+app.patch("/api/allocations/:id/cancel", async (req, res) => {
+  const { db } = require("./firebase");
 
-  if (!useMongo && requests.length === 0 && resources.length === 0) {
-    const { randomUUID } = require("crypto");
+  const allocationId = req.params.id;
 
-    requests = [
-      {
-        _id: randomUUID(),
-        title: "Meal packets for a community event",
-        description: "Meals needed for local families.",
-        category: "Food",
-        quantity: 20,
-        location: "Kadwad",
-        urgency: "Critical",
-        status: "Open",
-        createdAt: new Date()
-      },
-      {
-        _id: randomUUID(),
-        title: "School textbooks for students",
-        description: "Books for students who need learning materials.",
-        category: "Education",
-        quantity: 10,
-        location: "Karwar",
-        urgency: "High",
-        status: "Open",
-        createdAt: new Date()
-      },
-      {
-        _id: randomUUID(),
-        title: "Blankets for a community shelter",
-        description: "Blankets for shelter residents.",
-        category: "Shelter",
-        quantity: 5,
-        location: "Kadwad",
-        urgency: "Medium",
-        status: "Open",
-        createdAt: new Date()
-      }
-    ];
-
-    resources = [
-      {
-        _id: randomUUID(),
-        title: "Freshly prepared meal packets",
-        description: "Available meal packets for community distribution.",
-        category: "Food",
-        quantity: 25,
-        location: "Kadwad",
-        createdAt: new Date()
-      },
-      {
-        _id: randomUUID(),
-        title: "Unused school textbooks",
-        description: "A collection of textbooks available for donation.",
-        category: "Education",
-        quantity: 8,
-        location: "Karwar",
-        createdAt: new Date()
-      },
-      {
-        _id: randomUUID(),
-        title: "Warm blankets",
-        description: "Clean blankets available for community use.",
-        category: "Shelter",
-        quantity: 10,
-        location: "Kadwad",
-        createdAt: new Date()
-      },
-      {
-        _id: randomUUID(),
-        title: "Extra packaged meals",
-        description: "Additional meal packets from a local donor.",
-        category: "Food",
-        quantity: 10,
-        location: "Karwar",
-        createdAt: new Date()
-      }
-    ];
-
-    console.log("Demo requests and resources loaded.");
-  }
-
-  app.listen(process.env.PORT || 5000, () => {
-    console.log("Humanova API running at http://localhost:5000");
-  });
-}
-
-
-
-app.get("/api/emergency", async (req, res) => {
   try {
-    const [requestList, resourceList] = await Promise.all([
-      allRequests(),
-      allResources(),
+    const result = await db.runTransaction(async (transaction) => {
+      const allocationRef = db.collection("allocations").doc(allocationId);
+      const allocationSnap = await transaction.get(allocationRef);
+
+      if (!allocationSnap.exists) {
+        const error = new Error("Allocation not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const allocation = allocationSnap.data();
+
+      if (allocation.status !== "Reserved") {
+        const error = new Error(
+          `Cannot cancel an allocation with status ${allocation.status}.`
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+
+      const quantity = Number(allocation.quantity);
+
+      if (!Number.isSafeInteger(quantity) || quantity < 1) {
+        const error = new Error("Invalid allocation quantity.");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      const resourceRef = db.collection("resources").doc(allocation.resourceId);
+      const requestRef = db.collection("requests").doc(allocation.requestId);
+
+      // Read every document before making transaction writes.
+      const [resourceSnap, requestSnap] = await Promise.all([
+        transaction.get(resourceRef),
+        transaction.get(requestRef)
+      ]);
+
+      if (!resourceSnap.exists || !requestSnap.exists) {
+        const error = new Error(
+          "Related resource or request was not found. No changes were made."
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+
+      const resource = resourceSnap.data();
+      const request = requestSnap.data();
+
+      const stock = Number(resource.quantity);
+      const allocated = Number(request.allocatedQuantity ?? 0);
+      const requested = Number(request.quantity);
+
+      if (
+        !Number.isSafeInteger(stock) || stock < 0 ||
+        !Number.isSafeInteger(allocated) || allocated < quantity ||
+        !Number.isSafeInteger(requested) || requested < allocated
+      ) {
+        const error = new Error(
+          "Invalid stock or allocation totals. No changes were made."
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+
+      // Restore the resource and release the request quantity.
+      transaction.update(resourceRef, {
+        quantity: stock + quantity
+      });
+
+      transaction.update(requestRef, {
+        allocatedQuantity: allocated - quantity,
+        status: "Open"
+      });
+
+      transaction.update(allocationRef, {
+        status: "Cancelled",
+        cancelledAt: new Date()
+      });
+
+      return {
+        allocationId,
+        restoredQuantity: quantity,
+        remainingStock: stock + quantity,
+        remainingAllocated: allocated - quantity
+      };
+    });
+
+    return res.json({
+      success: true,
+      message: "Allocation cancelled and quantities restored.",
+      ...result
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        error: error.message
+      });
+    }
+
+    console.error("Allocation cancellation failed:", error);
+    return res.status(500).json({
+      error: "Unable to cancel allocation. Check backend logs."
+    });
+  }
+});
+
+
+// Emergency priority report
+app.get("/api/emergency", async (req, res, next) => {
+  try {
+    const [requests, resources] = await Promise.all([
+      getAll("requests"),
+      getAll("resources")
     ]);
 
-    const urgencyRank = {
-      Critical: 4,
-      High: 3,
-      Medium: 2,
-      Low: 1,
-    };
-
-    const now = new Date();
-
-    // Allocate stock to the most urgent requests first.
-    const activeRequests = requestList
-      .filter((request) => request.status !== "Fulfilled")
-      .sort((a, b) => {
-        const urgencyDifference =
-          (urgencyRank[b.urgency] || 1) -
-          (urgencyRank[a.urgency] || 1);
-
-        if (urgencyDifference !== 0) {
-          return urgencyDifference;
-        }
-
-        return (
-          new Date(a.createdAt || 0) -
-          new Date(b.createdAt || 0)
-        );
-      });
-
-    // Temporary stock ledger prevents double-counting
-    // across requests in this emergency report.
-    const remainingStock = new Map(
-      resourceList.map((resource) => [
-        String(resource._id),
-        Math.max(0, Number(resource.quantity) || 0),
+    // Local stock ledger prevents the report from counting
+    // the same available stock toward multiple requests.
+    const stockLedger = new Map(
+      resources.map(resource => [
+        resource._id,
+        isExpired(resource) ? 0 : availableStock(resource)
       ])
     );
 
-    const emergencyRequests = activeRequests.map((request) => {
-      const needed = Math.max(
-        0,
-        Number(request.quantity) || 0
-      );
+    const urgencyWeight = {
+      Critical: 4,
+      High: 3,
+      Medium: 2,
+      Low: 1
+    };
 
-      const requestCategory = String(
-        request.category || ""
-      ).toLowerCase();
+    const priorityRequests = requests
+      .filter(request => remainingNeed(request) > 0)
+      .map(request => {
+        const urgency = urgencyWeight[request.urgency] || 1;
+        const need = remainingNeed(request);
 
-      const requestLocation = String(
-        request.location || ""
-      ).trim().toLowerCase();
+        return {
+          ...request,
+          remainingNeed: need,
+          priorityScore: urgency * 100 + Math.min(need, 99)
+        };
+      })
+      .sort((a, b) => b.priorityScore - a.priorityScore);
 
-      // Same-category resources are eligible.
-      // Local resources are preferred, not required.
-      const eligibleResources = resourceList
-        .filter((resource) => {
-          const sameCategory =
-            String(resource.category || "").toLowerCase() ===
-            requestCategory;
+    const ranked = priorityRequests.map(request => {
+      let availableQuantity = 0;
+      let remainingShortage = remainingNeed(request);
 
-          const remaining =
-            remainingStock.get(String(resource._id)) || 0;
-
-          const expiry = resource.availableUntil
-            ? new Date(resource.availableUntil)
-            : null;
-
-          const notExpired =
-            !expiry ||
-            Number.isNaN(expiry.getTime()) ||
-            expiry >= now;
-
-          return sameCategory && remaining > 0 && notExpired;
-        })
+      const matchingResources = resources
+        .filter(resource =>
+          resource.category === request.category &&
+          !isExpired(resource) &&
+          (stockLedger.get(resource._id) || 0) > 0
+        )
         .sort((a, b) => {
-          const aLocal =
-            String(a.location || "").trim().toLowerCase() ===
-            requestLocation;
+          const aSame =
+            cleanString(a.location).toLowerCase() ===
+            cleanString(request.location).toLowerCase();
+          const bSame =
+            cleanString(b.location).toLowerCase() ===
+            cleanString(request.location).toLowerCase();
 
-          const bLocal =
-            String(b.location || "").trim().toLowerCase() ===
-            requestLocation;
+          return Number(bSame) - Number(aSame);
+        })
+        .map(resource => {
+          const stock = stockLedger.get(resource._id) || 0;
+          const used = Math.min(stock, remainingShortage);
 
-          if (aLocal !== bLocal) {
-            return aLocal ? -1 : 1;
-          }
+          stockLedger.set(resource._id, stock - used);
+          availableQuantity += used;
+          remainingShortage -= used;
 
-          // Use resources with earlier expiry dates first.
-          const aExpiry = a.availableUntil
-            ? new Date(a.availableUntil).getTime()
-            : Infinity;
+          return {
+            ...resource,
+            availableQuantity: stock,
+            suggestedQuantity: used
+          };
+        })
+        .filter(resource => resource.suggestedQuantity > 0);
 
-          const bExpiry = b.availableUntil
-            ? new Date(b.availableUntil).getTime()
-            : Infinity;
-
-          if (aExpiry !== bExpiry) {
-            return aExpiry - bExpiry;
-          }
-
-          return (
-            new Date(a.createdAt || 0) -
-            new Date(b.createdAt || 0)
-          );
-        });
-
-      let remainingNeed = needed;
-      const matchingResources = [];
-
-      for (const resource of eligibleResources) {
-        if (remainingNeed <= 0) break;
-
-        const resourceId = String(resource._id);
-        const stockBefore =
-          remainingStock.get(resourceId) || 0;
-
-        const allocatedQuantity = Math.min(
-          stockBefore,
-          remainingNeed
-        );
-
-        if (allocatedQuantity <= 0) continue;
-
-        remainingStock.set(
-          resourceId,
-          stockBefore - allocatedQuantity
-        );
-
-        remainingNeed -= allocatedQuantity;
-
-        matchingResources.push({
-          ...resource,
-
-          // The current frontend displays resource.quantity.
-          // Here it means the amount allocated to this request.
-          quantity: allocatedQuantity,
-          allocatedQuantity,
-          originalQuantity: Math.max(
-            0,
-            Number(resource.quantity) || 0
-          ),
-          sameLocation:
-            String(resource.location || "")
-              .trim()
-              .toLowerCase() === requestLocation,
-        });
-      }
-
-      const availableQuantity = needed - remainingNeed;
-      const shortage = Math.max(0, remainingNeed);
-
-      const coveragePercent = needed > 0
-        ? Math.min(
-            100,
-            Math.round(
-              (availableQuantity / needed) * 100
-            )
-          )
+      const need = remainingNeed(request);
+      const coveragePercent = need > 0
+        ? Math.round((availableQuantity / need) * 100)
         : 100;
 
-      let coverageStatus = "Fully covered";
-
-      if (availableQuantity === 0) {
-        coverageStatus = "Unmatched";
-      } else if (shortage > 0) {
-        coverageStatus = "Partially covered";
-      }
-
-      const urgency = urgencyRank[request.urgency] || 1;
-
-      const shortageRatio = needed > 0
-        ? shortage / needed
-        : 0;
-
-      const priorityScore = Math.round(
-        urgency * 100 + shortageRatio * 50
-      );
-
       return {
-        ...(typeof request.toObject === "function"
-          ? request.toObject()
-          : request),
-        priorityScore,
+        ...request,
         availableQuantity,
-        shortage,
+        shortage: Math.max(0, need - availableQuantity),
         coveragePercent,
-        coverageStatus,
-        matchingResourceCount: matchingResources.length,
-        matchingResources,
+        coverageStatus:
+          availableQuantity >= need
+            ? "Covered"
+            : availableQuantity > 0
+              ? "Partially Covered"
+              : "Uncovered",
+        matchingResources
       };
     });
 
-    // Sort using the actual calculated priority score.
-    emergencyRequests.sort((a, b) => {
-      if (b.priorityScore !== a.priorityScore) {
-        return b.priorityScore - a.priorityScore;
-      }
-
-      return (
-        new Date(a.createdAt || 0) -
-        new Date(b.createdAt || 0)
-      );
-    });
-
     res.json({
-      success: true,
       summary: {
-        activeNeeds: emergencyRequests.length,
-
-        criticalNeeds: emergencyRequests.filter(
-          (item) => item.urgency === "Critical"
+        totalRequests: ranked.length,
+        criticalRequests: ranked.filter(
+          item => item.urgency === "Critical"
         ).length,
-
-        highPriorityNeeds: emergencyRequests.filter(
-          (item) => item.urgency === "High"
+        uncoveredRequests: ranked.filter(
+          item => item.coverageStatus === "Uncovered"
         ).length,
-
-        unmatchedNeeds: emergencyRequests.filter(
-          (item) => item.coverageStatus === "Unmatched"
-        ).length,
-
-        partiallyCoveredNeeds: emergencyRequests.filter(
-          (item) =>
-            item.coverageStatus === "Partially covered"
-        ).length,
+        partiallyCoveredRequests: ranked.filter(
+          item => item.coverageStatus === "Partially Covered"
+        ).length
       },
-      requests: emergencyRequests,
+      requests: ranked
     });
   } catch (error) {
-    console.error("Emergency mode error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Unable to load emergency needs.",
-    });
+    next(error);
   }
 });
 
+// Central error handler
+app.use((error, req, res, next) => {
+  console.error("API error:", error);
 
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(error.statusCode || 500).json({
+    message:
+      error.statusCode && error.statusCode < 500
+        ? error.message
+        : "An internal server error occurred."
+  });
+});
+
+// Do not start a fake in-memory database if Firestore fails.
+async function start() {
+  try {
+    await db.collection("requests").limit(1).get();
+
+    app.listen(PORT, () => {
+      console.log(`Humanova API running at http://localhost:${PORT}`);
+      console.log("Database: Firebase Firestore");
+    });
+  } catch (error) {
+    console.error("Could not connect to Firestore:", error.message);
+    process.exit(1);
+  }
+}
 
 start();

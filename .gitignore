@@ -9,6 +9,8 @@ build/
 
 # Environment variables and secrets
 .env
+firebase-service-account.json
+node_modules/
 .env.*
 !.env.example
 
