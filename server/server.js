@@ -407,4 +407,118 @@ async function start() {
   });
 }
 
+
+app.get("/api/emergency", async (req, res) => {
+  try {
+    const [requestList, resourceList] = await Promise.all([
+      allRequests(),
+      allResources(),
+    ]);
+
+    const urgencyRank = {
+      Critical: 4,
+      High: 3,
+      Medium: 2,
+      Low: 1,
+    };
+
+    // Fulfilled needs no longer require emergency attention.
+    const activeRequests = requestList.filter(
+      (request) => request.status !== "Fulfilled"
+    );
+
+    const emergencyRequests = activeRequests.map((request) => {
+      const needed = Math.max(0, Number(request.quantity) || 0);
+
+      // Find resources in the same category that have quantity available.
+      const matchingResources = resourceList.filter((resource) => {
+        const sameCategory =
+          String(resource.category || "").toLowerCase() ===
+          String(request.category || "").toLowerCase();
+
+        const available = Number(resource.quantity) || 0;
+
+        return sameCategory && available > 0;
+      });
+
+      const availableQuantity = matchingResources.reduce(
+        (total, resource) =>
+          total + Math.max(0, Number(resource.quantity) || 0),
+        0
+      );
+
+      const shortage = Math.max(0, needed - availableQuantity);
+      const coveragePercent =
+        needed > 0
+          ? Math.min(
+              100,
+              Math.round((availableQuantity / needed) * 100)
+            )
+          : 100;
+
+      let coverageStatus = "Fully covered";
+
+      if (matchingResources.length === 0) {
+        coverageStatus = "Unmatched";
+      } else if (shortage > 0) {
+        coverageStatus = "Partially covered";
+      }
+
+      const urgency = urgencyRank[request.urgency] || 1;
+
+      // Higher urgency comes first; larger shortages break ties.
+      const priorityScore =
+        urgency * 100 + (needed > 0 ? (shortage / needed) * 50 : 0);
+
+      return {
+        ...request.toObject?.() || request,
+        priorityScore: Math.round(priorityScore),
+        availableQuantity,
+        shortage,
+        coveragePercent,
+        coverageStatus,
+        matchingResourceCount: matchingResources.length,
+        matchingResources,
+      };
+    });
+
+    emergencyRequests.sort((a, b) => {
+      const urgencyDifference =
+        (urgencyRank[b.urgency] || 1) -
+        (urgencyRank[a.urgency] || 1);
+
+      if (urgencyDifference !== 0) return urgencyDifference;
+
+      return b.shortage - a.shortage;
+    });
+
+    res.json({
+      success: true,
+      summary: {
+        activeNeeds: emergencyRequests.length,
+        criticalNeeds: emergencyRequests.filter(
+          (item) => item.urgency === "Critical"
+        ).length,
+        highPriorityNeeds: emergencyRequests.filter(
+          (item) => item.urgency === "High"
+        ).length,
+        unmatchedNeeds: emergencyRequests.filter(
+          (item) => item.coverageStatus === "Unmatched"
+        ).length,
+        partiallyCoveredNeeds: emergencyRequests.filter(
+          (item) => item.coverageStatus === "Partially covered"
+        ).length,
+      },
+      requests: emergencyRequests,
+    });
+  } catch (error) {
+    console.error("Emergency mode error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Unable to load emergency needs.",
+    });
+  }
+});
+
+
 start();
