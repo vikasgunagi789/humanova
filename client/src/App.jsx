@@ -111,6 +111,117 @@ function normalizeEmergency(data) {
   };
 }
 
+
+function buildCrisisRadar(requests) {
+  const areas = new Map();
+
+  for (const request of requests) {
+    const location = String(request.location || "").trim() || "Location not specified";
+    const key = location.toLowerCase();
+
+    if (!areas.has(key)) {
+      areas.set(key, {
+        location,
+        totalNeeds: 0,
+        criticalNeeds: 0,
+        highPriorityNeeds: 0,
+        outstandingUnits: 0,
+        unmatchedNeeds: 0,
+        requests: [],
+      });
+    }
+
+    const area = areas.get(key);
+    const shortage = Math.max(
+      0,
+      Number(request.shortage ?? request.remainingNeed ?? request.quantity) || 0
+    );
+
+    area.totalNeeds += 1;
+    area.outstandingUnits += shortage;
+    area.requests.push(request);
+
+    if (request.urgency === "Critical") {
+      area.criticalNeeds += 1;
+    }
+
+    if (request.urgency === "High") {
+      area.highPriorityNeeds += 1;
+    }
+
+    if (
+      shortage > 0 &&
+      Number(request.availableQuantity || 0) === 0
+    ) {
+      area.unmatchedNeeds += 1;
+    }
+  }
+
+  return Array.from(areas.values())
+    .map((area) => {
+      const sortedRequests = [...area.requests].sort(
+        (a, b) => (Number(b.priorityScore) || 0) -
+                  (Number(a.priorityScore) || 0)
+      );
+
+      let severity = "Moderate";
+
+      if (area.criticalNeeds > 0 || area.unmatchedNeeds >= 3) {
+        severity = "Critical";
+      } else if (
+        area.highPriorityNeeds > 0 ||
+        area.unmatchedNeeds > 0 ||
+        area.outstandingUnits >= 20
+      ) {
+        severity = "High";
+      }
+
+      return {
+        ...area,
+        severity,
+        representativeRequest: sortedRequests[0] || null,
+      };
+    })
+    .sort((a, b) => {
+      const severityWeight = {
+        Critical: 3,
+        High: 2,
+        Moderate: 1,
+      };
+
+      return (
+        severityWeight[b.severity] - severityWeight[a.severity] ||
+        b.outstandingUnits - a.outstandingUnits
+      );
+    });
+}
+
+function formatAllocationDate(value) {
+  if (!value) return "Date unavailable";
+
+  let date;
+
+  if (typeof value.toDate === "function") {
+    date = value.toDate();
+  } else if (typeof value._seconds === "number") {
+    date = new Date(value._seconds * 1000);
+  } else if (typeof value.seconds === "number") {
+    date = new Date(value.seconds * 1000);
+  } else {
+    date = new Date(value);
+  }
+
+  if (Number.isNaN(date.getTime())) {
+    return "Date unavailable";
+  }
+
+  return date.toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+
 function Field({ label, children }) {
   return (
     <label className="field">
@@ -129,6 +240,7 @@ function App() {
   const [emergency, setEmergency] = useState(EMPTY_EMERGENCY);
   const [selected, setSelected] = useState(null);
   const [matches, setMatches] = useState([]);
+  const [allocationQuantities, setAllocationQuantities] = useState({});
   const [showForm, setShowForm] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -166,10 +278,17 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
           ? resourcesData.resources
           : [];
 
-      setDashboard(dashboardData || {});
-      setRequests(nextRequests);
-      setResources(nextResources);
-      setEmergency(normalizeEmergency(emergencyData));
+      
+setDashboard(dashboardData || {});
+setRequests(nextRequests);
+setResources(nextResources);
+setAllocations(
+  Array.isArray(dashboardData?.allocations)
+    ? dashboardData.allocations
+    : []
+);
+setEmergency(normalizeEmergency(emergencyData));
+
 
       setSelected((current) => {
         if (!current?._id) return null;
@@ -265,6 +384,88 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
     }
   };
 
+  const allocateResource = async (request, match) => {
+    const resource = match?.resource;
+    if (!request?._id || !resource?._id || busy) return;
+
+    const remainingNeed = Math.max(
+      0,
+      Number(request.quantity || 0) - Number(request.allocatedQuantity || 0)
+    );
+    const available = Number(match.availableQuantity ?? resource.quantity ?? 0);
+    const suggested = Math.min(remainingNeed, available);
+    const quantity = Number(
+      allocationQuantities[resource._id] ?? suggested
+    );
+
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
+      setError("Enter a whole-number allocation quantity greater than zero.");
+      return;
+    }
+    if (quantity > available || quantity > remainingNeed) {
+      setError(`Choose no more than ${Math.min(available, remainingNeed)} units.`);
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const allocation = await api("/allocations", {
+        method: "POST",
+        body: JSON.stringify({
+          requestId: request._id,
+          resourceId: resource._id,
+          quantity,
+        }),
+      });
+
+      setNotice(
+        `Successfully reserved ${quantity} unit${quantity === 1 ? "" : "s"} of ${resource.title}. ` +
+        `${Number(allocation.remainingNeed) || 0} unit(s) still needed.`
+      );
+      setAllocationQuantities((old) => ({ ...old, [resource._id]: "" }));
+      await refresh();
+      const updated = await api(`/matches/${encodeURIComponent(request._id)}`);
+      setMatches(Array.isArray(updated?.matches) ? updated.matches : []);
+      const updatedRequest = updated?.request || request;
+      setSelected(updatedRequest);
+    } catch (err) {
+      setError(err.message || "Unable to allocate this resource.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  
+async function cancelAllocation(allocation) {
+  const confirmed = window.confirm(
+    `Cancel the allocation of ${allocation.quantity} unit(s) of ${
+      allocation.resourceTitle || "this resource"
+    }? The stock will be restored if cancellation succeeds.`
+  );
+
+  if (!confirmed) return;
+
+  setBusy(true);
+  setError("");
+  setNotice("");
+
+  try {
+    await api(`/allocations/${allocation._id}/cancel`, {
+      method: "PATCH",
+    });
+
+    setNotice("Allocation cancelled successfully. Resource stock has been restored.");
+    await refresh();
+  } catch (err) {
+    setError(err.message || "Failed to cancel allocation.");
+  } finally {
+    setBusy(false);
+  }
+}
+
+
   const changeStatus = async (request, status) => {
     if (!request?._id || busy) return;
 
@@ -345,13 +546,88 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
   ];
 
   const nav = [
-    { id: "dashboard", label: "Overview", icon: LayoutDashboard },
-    { id: "requests", label: "Community needs", icon: HandHeart },
-    { id: "resources", label: "Resources", icon: Package },
-    { id: "emergency", label: "Emergency mode", icon: Siren },
-  ];
+  { id: "dashboard", label: "Overview", icon: LayoutDashboard },
+  { id: "requests", label: "Community needs", icon: HandHeart },
+  { id: "resources", label: "Resources", icon: Package },
+  { id: "allocations", label: "Allocation history", icon: History },
+  { id: "emergency", label: "Emergency mode", icon: Siren },
+];
 
   const activeEmergencyRequests = emergency.requests;
+  
+const impactMetrics = (() => {
+  const totalRequests = requests.length;
+
+  const fulfilledRequests = requests.filter(
+    (request) => request.status === "Fulfilled"
+  ).length;
+
+  const allocatedUnits = allocations.reduce((total, allocation) => {
+    if (allocation.status === "Cancelled") return total;
+
+    return total + Math.max(0, Number(allocation.quantity) || 0);
+  }, 0);
+
+  const outstandingUnits = requests.reduce((total, request) => {
+    if (request.status === "Fulfilled") return total;
+
+    const quantity = Math.max(0, Number(request.quantity) || 0);
+    const allocated = Math.max(
+      0,
+      Number(request.allocatedQuantity) || 0
+    );
+
+    return total + Math.max(0, quantity - allocated);
+  }, 0);
+
+  return {
+    totalRequests,
+    fulfilledRequests,
+    allocatedUnits,
+    outstandingUnits,
+    fulfillmentRate:
+      totalRequests > 0
+        ? Math.round((fulfilledRequests / totalRequests) * 100)
+        : 0,
+  };
+})();
+
+const filteredAllocations = allocations.filter((allocation) => {
+  const search = allocationSearch.trim().toLowerCase();
+
+  const matchesSearch =
+    !search ||
+    [
+      allocation.requestTitle,
+      allocation.resourceTitle,
+      allocation.location,
+      allocation.requestId,
+      allocation.resourceId,
+      allocation.status,
+    ].some((value) =>
+      String(value || "").toLowerCase().includes(search)
+    );
+
+  const matchesStatus =
+    allocationStatusFilter === "All" ||
+    allocation.status === allocationStatusFilter;
+
+  return matchesSearch && matchesStatus;
+});
+
+
+// const rankedMatches = [...matches]
+//   .map((resource) => ({
+//     ...resource,
+//     humanovaMatch: rankResourceMatch(selected || {}, resource),
+//   }))
+//   .sort(
+//     (a, b) =>
+//       b.humanovaMatch.score - a.humanovaMatch.score
+//   );
+
+
+  const crisisAreas = buildCrisisRadar(activeEmergencyRequests);
 
   return (
     <div className="app-shell">
@@ -430,14 +706,16 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
             </div>
             <h1>
               {page === "dashboard"
-                ? "Community overview"
-                : page === "requests"
-                  ? "Community needs"
-                  : page === "resources"
-                    ? "Available resources"
-                    : page === "emergency"
-                      ? "Community Emergency Mode"
-                      : "Intelligent matching"}
+  ? "Community overview"
+  : page === "requests"
+    ? "Community needs"
+    : page === "resources"
+      ? "Available resources"
+      : page === "allocations"
+        ? "Allocation history"
+        : page === "emergency"
+          ? "Community Emergency Mode"
+          : "Intelligent matching"}
             </h1>
           </div>
 
@@ -541,6 +819,109 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
                 );
               })}
             </section>
+
+            
+<section className="impact-tracker panel">
+  <div className="impact-tracker-header">
+    <div>
+      <span className="impact-tracker-eyebrow">
+        <Activity size={15} />
+        MEASURABLE COMMUNITY IMPACT
+      </span>
+      <h3>Every resource creates an impact.</h3>
+      <p>
+        A live summary of community needs and the resources
+        coordinated through Humanova.
+      </p>
+    </div>
+
+    <button
+      type="button"
+      className="impact-refresh"
+      onClick={refresh}
+      disabled={loading}
+    >
+      <RefreshCw size={15} />
+      Refresh
+    </button>
+  </div>
+
+  <div className="impact-metric-grid">
+    <article className="impact-metric">
+      <div className="impact-metric-icon impact-teal">
+        <CheckCircle2 size={21} />
+      </div>
+      <span>Requests fulfilled</span>
+      <strong>{loading ? "—" : impactMetrics.fulfilledRequests}</strong>
+      <small>Confirmed as fulfilled</small>
+    </article>
+
+    <article className="impact-metric">
+      <div className="impact-metric-icon impact-blue">
+        <Package size={21} />
+      </div>
+      <span>Units allocated</span>
+      <strong>{loading ? "—" : impactMetrics.allocatedUnits}</strong>
+      <small>Reserved through allocations</small>
+    </article>
+
+    <article className="impact-metric">
+      <div className="impact-metric-icon impact-purple">
+        <Activity size={21} />
+      </div>
+      <span>Fulfillment rate</span>
+      <strong>
+        {loading ? "—" : `${impactMetrics.fulfillmentRate}%`}
+      </strong>
+      <small>Fulfilled requests / all requests</small>
+    </article>
+
+    <article className="impact-metric">
+      <div className="impact-metric-icon impact-orange">
+        <TriangleAlert size={21} />
+      </div>
+      <span>Outstanding units</span>
+      <strong>{loading ? "—" : impactMetrics.outstandingUnits}</strong>
+      <small>Quantity still needed</small>
+    </article>
+  </div>
+
+  <div className="impact-progress-section">
+    <div className="impact-progress-heading">
+      <div>
+        <strong>Community fulfillment progress</strong>
+        <p>Requests marked as fulfilled</p>
+      </div>
+      <strong>{loading ? "—" : `${impactMetrics.fulfillmentRate}%`}</strong>
+    </div>
+
+    <div
+      className="impact-progress-track"
+      role="progressbar"
+      aria-label="Community request fulfillment rate"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={impactMetrics.fulfillmentRate}
+    >
+      <div
+        className="impact-progress-fill"
+        style={{
+          width: `${impactMetrics.fulfillmentRate}%`,
+        }}
+      />
+    </div>
+
+    <div className="impact-progress-footer">
+      <span>
+        {impactMetrics.fulfilledRequests} fulfilled
+      </span>
+      <span>
+        {impactMetrics.totalRequests} total requests
+      </span>
+    </div>
+  </div>
+</section>
+
 
             <section className="content-grid">
               <div className="panel">
@@ -699,6 +1080,173 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
           </section>
         )}
 
+        {page === "allocations" && (
+  <section className="panel page-panel">
+    <div className="panel-heading">
+      <div>
+        <h3>Resource allocation history</h3>
+        <p>
+          Track which resources were reserved for community
+          requests and monitor their status.
+        </p>
+      </div>
+
+      <button
+        type="button"
+        className="btn primary"
+        onClick={refresh}
+        disabled={loading}
+      >
+        <RefreshCw size={16} />
+        Refresh history
+      </button>
+    </div>
+
+    <div className="allocation-history-summary">
+      <div>
+        <span>Total records</span>
+        <strong>{allocations.length}</strong>
+      </div>
+
+      <div>
+        <span>Reserved</span>
+        <strong>
+          {allocations.filter(
+            (item) => item.status === "Reserved"
+          ).length}
+        </strong>
+      </div>
+
+      <div>
+        <span>Cancelled</span>
+        <strong>
+          {allocations.filter(
+            (item) => item.status === "Cancelled"
+          ).length}
+        </strong>
+      </div>
+
+      <div>
+        <span>Units reserved</span>
+        <strong>
+          {allocations.reduce(
+            (total, item) =>
+              item.status === "Cancelled"
+                ? total
+                : total + Math.max(0, Number(item.quantity) || 0),
+            0
+          )}
+        </strong>
+      </div>
+    </div>
+
+    <div className="allocation-history-controls">
+      <label className="allocation-search">
+        <Search size={17} />
+        <input
+          type="search"
+          placeholder="Search requests, resources, or locations..."
+          value={allocationSearch}
+          onChange={(event) =>
+            setAllocationSearch(event.target.value)
+          }
+        />
+      </label>
+
+      <select
+        aria-label="Filter allocations by status"
+        value={allocationStatusFilter}
+        onChange={(event) =>
+          setAllocationStatusFilter(event.target.value)
+        }
+      >
+        <option value="All">All statuses</option>
+        <option value="Reserved">Reserved</option>
+        <option value="Cancelled">Cancelled</option>
+      </select>
+    </div>
+
+    {loading ? (
+      <EmptyState text="Loading allocation history..." />
+    ) : filteredAllocations.length === 0 ? (
+      <EmptyState
+        text={
+          allocations.length === 0
+            ? "No allocations yet. Allocate a compatible resource to see the record here."
+            : "No allocations match your search or selected status."
+        }
+      />
+    ) : (
+      <div className="allocation-history-list">
+        {filteredAllocations.map((allocation, index) => (
+          <article
+            className="allocation-history-card"
+            key={allocation._id || allocation.id || index}
+          >
+            <div className="allocation-history-icon">
+              <Package size={22} />
+            </div>
+
+            <div className="allocation-history-details">
+              <div className="allocation-history-title">
+                <h4>
+                  {allocation.resourceTitle || "Resource"}
+                </h4>
+
+                <span
+                  className={`allocation-status ${
+                    allocation.status === "Cancelled"
+                      ? "allocation-status-cancelled"
+                      : "allocation-status-reserved"
+                  }`}
+                >
+                  {allocation.status || "Unknown"}
+                </span>
+              </div>
+
+              {allocation.status !== "Cancelled" && (
+      <button
+        type="button"
+        className="btn btn-danger"
+        disabled={busy}
+        onClick={() => cancelAllocation(allocation)}
+      >
+        Cancel Allocation
+      </button>
+    )}
+
+              <p>
+                <strong>Request:</strong>{" "}
+                {allocation.requestTitle || "Unnamed request"}
+              </p>
+
+              <p>
+                <strong>Quantity:</strong>{" "}
+                {Number(allocation.quantity) || 0} unit(s)
+              </p>
+
+              <p>
+                <MapPin size={14} />
+                {allocation.location || "Location not specified"}
+              </p>
+
+              <p>
+                <CalendarDays size={14} />
+                {formatAllocationDate(allocation.createdAt)}
+              </p>
+
+              <small>
+                Allocation ID:{" "}
+                {allocation._id || allocation.id || "Unavailable"}
+              </small>
+            </div>
+          </article>
+        ))}
+      </div>
+    )}
+  </section>
+)}
+
         {page === "matches" && (
           <section className="panel page-panel">
             <div className="panel-heading">
@@ -748,19 +1296,56 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
 
                   <h3>{selected.title}</h3>
                   <p>
-                    {selected.quantity} needed · {selected.location} ·{" "}
-                    {selected.category}
+                    {Math.max(0, Number(selected.quantity || 0) - Number(selected.allocatedQuantity || 0))} units still needed · {Number(selected.allocatedQuantity || 0)} allocated · {selected.location} · {selected.category}
                   </p>
-                  <p>Status: {selected.status}</p>
+                  <p>Status: {selected.status} · Recommendations use transparent rules, not a machine-learning prediction.</p>
                 </div>
 
                 {matches.length === 0 ? (
-                  <EmptyState text="No compatible resources yet. Add a resource in the same category and check again." />
+                  <EmptyState text={
+                    Number(selected.quantity || 0) <= Number(selected.allocatedQuantity || 0)
+                      ? "This request is fully allocated. No outstanding need remains."
+                      : "No compatible resources yet. Add a non-expired resource in the same category and check again."
+                  } />
                 ) : (
                   matches.map((match, index) => {
                     const resource = match.resource;
 
-                    if (!resource) return null;
+if (!resource) return null;
+
+const matchScore = Math.max(
+  0,
+  Math.min(100, Number(match.score) || 0)
+);
+
+const remainingNeed = Math.max(
+  0,
+  Number(selected.quantity || 0) -
+    Number(selected.allocatedQuantity || 0)
+);
+
+const availableStock = Math.max(
+  0,
+  Number(match.availableQuantity ?? resource.quantity ?? 0)
+);
+
+const suggestedQuantity = Math.max(
+  0,
+  Math.min(
+    Number(match.suggestedQuantity || 0),
+    availableStock,
+    remainingNeed
+  )
+);
+
+const recommendation =
+  matchScore >= 80
+    ? "Excellent match"
+    : matchScore >= 60
+      ? "Good match"
+      : matchScore >= 40
+        ? "Partial match"
+        : "Low compatibility";
 
                     return (
                       <article
@@ -781,18 +1366,17 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
                           </div>
 
                           <div className="score">
-                            <strong>
-                              {Math.max(
-                                0,
-                                Math.min(100, Number(match.score) || 0)
-                              )}
-                              %
-                            </strong>
-                            <span>match</span>
-                          </div>
+  <strong>{matchScore}%</strong>
+  <span>match</span>
+  <small className={`recommendation-label recommendation-${recommendation
+    .toLowerCase()
+    .replace(/\s+/g, "-")}`}>
+    {recommendation}
+  </small>
+</div>
                         </div>
 
-                        <div className="score-track">
+                         <div className="score-track">
                           <div
                             style={{
                               width: `${Math.max(
@@ -802,6 +1386,37 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
                             }}
                           />
                         </div>
+
+                        <div className="match-fulfillment">
+  <div className="match-fulfillment-heading">
+    <span>Request coverage</span>
+    <strong>
+      {remainingNeed > 0
+        ? `${Math.min(100, Math.round((suggestedQuantity / remainingNeed) * 100))}%`
+        : "100%"}
+    </strong>
+  </div>
+
+  <div className="match-fulfillment-track">
+    <div
+      style={{
+        width: `${
+          remainingNeed > 0
+            ? Math.min(100, (suggestedQuantity / remainingNeed) * 100)
+            : 100
+        }%`,
+      }}
+    />
+  </div>
+
+  <p>
+    Suggested allocation: <strong>{suggestedQuantity}</strong> units
+    {" · "}
+    Remaining need: <strong>{remainingNeed}</strong> units
+    {" · "}
+    Available stock: <strong>{availableStock}</strong> units
+  </p>
+</div>
 
                         <h4>
                           <BrainCircuit size={15} />
@@ -818,6 +1433,44 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
                               {reason}
                             </span>
                           ))}
+                        </div>
+
+                        <div className="allocation-action">
+                          <label className="allocation-quantity">
+                            <span>Units to allocate</span>
+                            <input
+                              type="number"
+                              min="1"
+                              max={Math.min(
+                                Number(match.availableQuantity ?? resource.quantity ?? 0),
+                                Math.max(0, Number(selected.quantity || 0) - Number(selected.allocatedQuantity || 0))
+                              )}
+                              value={allocationQuantities[resource._id] ?? String(match.suggestedQuantity || 1)}
+                              onChange={(event) => setAllocationQuantities((old) => ({
+                                ...old,
+                                [resource._id]: event.target.value,
+                              }))}
+                              disabled={
+  busy ||
+  !["Open", "Matched", "Accepted"].includes(selected.status)
+}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            className="btn primary"
+                            
+disabled={
+  busy ||
+  !["Open", "Matched", "Accepted"].includes(selected.status) ||
+  Number(match.availableQuantity ?? resource.quantity ?? 0) < 1 ||
+  Number(selected.quantity || 0) <= Number(selected.allocatedQuantity || 0)
+}
+
+                            onClick={() => allocateResource(selected, match)}
+                          >
+                            <Package size={16} /> {busy ? "Allocating…" : "Allocate resource"}
+                          </button>
                         </div>
 
                         {selected.status === "Open" && (
@@ -930,6 +1583,106 @@ const [allocationStatusFilter, setAllocationStatusFilter] =
                 <small>Additional resources needed</small>
               </article>
             </div>
+
+            
+<div className="crisis-radar panel">
+  <div className="crisis-radar-heading">
+    <div>
+      <span className="crisis-radar-eyebrow">
+        <MapPin size={15} />
+        COMMUNITY CRISIS RADAR
+      </span>
+      <h3>Where help is needed most</h3>
+      <p>
+        Areas ranked using outstanding requests, urgency,
+        and currently uncovered needs.
+      </p>
+    </div>
+
+    <div className="crisis-radar-count">
+      <strong>{crisisAreas.length}</strong>
+      <span>Areas monitored</span>
+    </div>
+  </div>
+
+  {crisisAreas.length === 0 ? (
+    <div className="crisis-radar-empty">
+      <CheckCircle2 size={22} />
+      <div>
+        <strong>No outstanding community needs</strong>
+        <p>New requests will appear here when submitted.</p>
+      </div>
+    </div>
+  ) : (
+    <div className="crisis-area-grid">
+      {crisisAreas.map((area) => (
+        <article
+          className={`crisis-area-card crisis-${area.severity.toLowerCase()}`}
+          key={area.location.toLowerCase()}
+        >
+          <div className="crisis-area-top">
+            <div className="crisis-area-location">
+              <MapPin size={17} />
+              <h4>{area.location}</h4>
+            </div>
+
+            <span className={`crisis-severity crisis-severity-${area.severity.toLowerCase()}`}>
+              {area.severity}
+            </span>
+          </div>
+
+          <div className="crisis-area-metrics">
+            <div>
+              <strong>{area.totalNeeds}</strong>
+              <span>Open needs</span>
+            </div>
+            <div>
+              <strong>{area.outstandingUnits}</strong>
+              <span>Units outstanding</span>
+            </div>
+          </div>
+
+          <div className="crisis-area-breakdown">
+            <span>
+              <i className="crisis-dot critical-dot" />
+              {area.criticalNeeds} critical
+            </span>
+            <span>
+              <i className="crisis-dot high-dot" />
+              {area.highPriorityNeeds} high priority
+            </span>
+            <span>
+              <i className="crisis-dot missing-dot" />
+              {area.unmatchedNeeds} unmatched
+            </span>
+          </div>
+
+          <div className="crisis-area-footer">
+            <span>
+              {area.severity === "Critical"
+                ? "Immediate attention recommended"
+                : area.severity === "High"
+                  ? "Additional support needed"
+                  : "Monitor outstanding needs"}
+            </span>
+
+            {area.representativeRequest && (
+              <button
+                type="button"
+                className="btn primary crisis-action"
+                onClick={() => viewMatches(area.representativeRequest)}
+              >
+                Find resources
+                <ArrowRight size={14} />
+              </button>
+            )}
+          </div>
+        </article>
+      ))}
+    </div>
+  )}
+</div>
+
 
             <div className="panel emergency-list-panel">
               <div className="panel-heading">

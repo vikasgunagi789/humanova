@@ -70,40 +70,50 @@ function remainingNeed(request) {
 }
 
 function calculateMatches(request, resources) {
+  const need = remainingNeed(request);
+
   return resources
-    .filter(resource => {
-      return (
-        resource.category === request.category &&
-        availableStock(resource) > 0 &&
-        !isExpired(resource)
-      );
-    })
+    .filter(resource =>
+      resource.category === request.category &&
+      availableStock(resource) > 0 &&
+      !isExpired(resource) &&
+      need > 0
+    )
     .map(resource => {
-      let score = 50;
-
-      if (
+      const stock = availableStock(resource);
+      const sameLocation =
         cleanString(resource.location).toLowerCase() ===
-        cleanString(request.location).toLowerCase()
-      ) {
-        score += 30;
-      }
+        cleanString(request.location).toLowerCase();
+      const enoughStock = stock >= need;
+      const coverage = Math.min(100, Math.round((stock / need) * 100));
+      const reasons = [
+        `Category match: ${request.category}`,
+        sameLocation
+          ? `Same location: ${request.location || "location not specified"}`
+          : `Different location: ${resource.location || "not specified"}`,
+        enoughStock
+          ? `Enough stock to cover all ${need} units needed`
+          : `Can cover ${Math.min(stock, need)} of ${need} units needed (${coverage}%)`
+      ];
 
-      if (availableStock(resource) >= remainingNeed(request)) {
-        score += 20;
-      } else {
-        score += Math.round(
-          20 * availableStock(resource) /
-          Math.max(1, remainingNeed(request))
-        );
-      }
+      // Transparent rules-based score; this is not a machine-learning prediction.
+      const score = Math.min(
+        100,
+        50 + (sameLocation ? 25 : 0) + (enoughStock ? 25 : Math.round(25 * stock / need))
+      );
 
       return {
-        ...resource,
-        availableQuantity: availableStock(resource),
-        matchScore: Math.min(100, score)
+        resource: { ...resource, quantity: stock, availableQuantity: stock },
+        score,
+        reasons,
+        availableQuantity: stock,
+        suggestedQuantity: Math.min(stock, need),
+        coveragePercent: coverage,
+        sameLocation,
+        enoughStock
       };
     })
-    .sort((a, b) => b.matchScore - a.matchScore);
+    .sort((a, b) => b.score - a.score || b.availableQuantity - a.availableQuantity);
 }
 
 // Health check
@@ -412,7 +422,7 @@ app.post("/api/allocations", async (req, res, next) => {
         const request = requestSnapshot.data();
         const resource = resourceSnapshot.data();
 
-        if (!["Open", "Matched"].includes(request.status)) {
+        if (!["Open", "Matched", "Accepted"].includes(request.status)) {
           const error = new Error(
             "Only Open or Matched requests can receive allocations."
           );
@@ -458,10 +468,19 @@ app.post("/api/allocations", async (req, res, next) => {
         const newStock = stock - quantity;
         const newAllocated =
           Number(request.allocatedQuantity || 0) + quantity;
-        const newStatus =
-          newAllocated >= Number(request.quantity)
-            ? "Matched"
-            : "Open";
+        const currentStatus = request.status || "Open";
+
+const isFullyAllocated =
+  newAllocated >= Number(request.quantity || 0);
+
+const newStatus =
+  currentStatus === "Accepted"
+    ? "Accepted"
+    : currentStatus === "Fulfilled"
+      ? "Fulfilled"
+      : isFullyAllocated
+        ? "Matched"
+        : "Open";
 
         const createdAt = new Date();
 
@@ -491,7 +510,10 @@ app.post("/api/allocations", async (req, res, next) => {
         return {
           ...allocationData,
           _id: allocationRef.id,
-          remainingNeed: Number(request.quantity) - newAllocated,
+          remainingNeed: Math.max(
+  0,
+  Number(request.quantity || 0) - newAllocated
+),
           remainingStock: newStock,
           requestStatus: newStatus
         };
@@ -514,9 +536,9 @@ app.get("/api/allocations", async (req, res, next) => {
 });
 
 
+
 app.patch("/api/allocations/:id/cancel", async (req, res) => {
   const { db } = require("./firebase");
-
   const allocationId = req.params.id;
 
   try {
@@ -573,9 +595,13 @@ app.patch("/api/allocations/:id/cancel", async (req, res) => {
       const requested = Number(request.quantity);
 
       if (
-        !Number.isSafeInteger(stock) || stock < 0 ||
-        !Number.isSafeInteger(allocated) || allocated < quantity ||
-        !Number.isSafeInteger(requested) || requested < allocated
+        !Number.isSafeInteger(stock) ||
+        stock < 0 ||
+        !Number.isSafeInteger(allocated) ||
+        allocated < quantity ||
+        !Number.isSafeInteger(requested) ||
+        requested < 1 ||
+        requested < allocated
       ) {
         const error = new Error(
           "Invalid stock or allocation totals. No changes were made."
@@ -584,14 +610,38 @@ app.patch("/api/allocations/:id/cancel", async (req, res) => {
         throw error;
       }
 
-      // Restore the resource and release the request quantity.
+      // Restore resource stock.
+      const restoredStock = stock + quantity;
+
+      if (!Number.isSafeInteger(restoredStock)) {
+        const error = new Error("Restored stock exceeds the valid quantity limit.");
+        error.statusCode = 409;
+        throw error;
+      }
+
       transaction.update(resourceRef, {
-        quantity: stock + quantity
+        quantity: restoredStock
       });
 
+      // Release the cancelled allocation quantity.
+      const remainingAllocated = allocated - quantity;
+      const currentStatus = request.status || "Open";
+
+      // Recalculate status without incorrectly matching partial allocations.
+      let restoredStatus;
+
+      if (currentStatus === "Accepted") {
+        restoredStatus = "Accepted";
+      } else if (remainingAllocated >= requested) {
+        restoredStatus =
+          currentStatus === "Fulfilled" ? "Fulfilled" : "Matched";
+      } else {
+        restoredStatus = "Open";
+      }
+
       transaction.update(requestRef, {
-        allocatedQuantity: allocated - quantity,
-        status: "Open"
+        allocatedQuantity: remainingAllocated,
+        status: restoredStatus
       });
 
       transaction.update(allocationRef, {
@@ -602,8 +652,9 @@ app.patch("/api/allocations/:id/cancel", async (req, res) => {
       return {
         allocationId,
         restoredQuantity: quantity,
-        remainingStock: stock + quantity,
-        remainingAllocated: allocated - quantity
+        remainingStock: restoredStock,
+        remainingAllocated,
+        requestStatus: restoredStatus
       };
     });
 
@@ -620,11 +671,13 @@ app.patch("/api/allocations/:id/cancel", async (req, res) => {
     }
 
     console.error("Allocation cancellation failed:", error);
+
     return res.status(500).json({
       error: "Unable to cancel allocation. Check backend logs."
     });
   }
 });
+
 
 
 // Emergency priority report
