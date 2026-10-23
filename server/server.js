@@ -215,18 +215,25 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 // Login an existing user
+
 app.post("/api/auth/login", async (req, res) => {
   try {
-    const email = String(req.body.email || "").trim().toLowerCase();
-    const password = req.body.password;
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
 
-    if (!email || typeof password !== "string") {
+    const password = req.body?.password;
+
+    if (!email || typeof password !== "string" || !password) {
       return res.status(400).json({
         message: "Email and password are required."
       });
     }
 
-    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    if (!process.env.JWT_SECRET ||
+        process.env.JWT_SECRET.length < 32) {
+      console.error("JWT_SECRET is missing or too short.");
+
       return res.status(500).json({
         message: "Authentication is not configured correctly."
       });
@@ -238,6 +245,8 @@ app.post("/api/auth/login", async (req, res) => {
       .get();
 
     if (snapshot.empty) {
+      console.log("Login rejected: no user found for supplied email.");
+
       return res.status(401).json({
         message: "Invalid email or password."
       });
@@ -245,19 +254,40 @@ app.post("/api/auth/login", async (req, res) => {
 
     const doc = snapshot.docs[0];
     const user = doc.data();
+
+    if (
+      typeof user.passwordHash !== "string" ||
+      !user.passwordHash.startsWith("$2")
+    ) {
+      console.error(
+        "Login rejected: stored password hash is missing or is not bcrypt."
+      );
+
+      return res.status(500).json({
+        message:
+          "This account uses an unsupported password format. Account recovery is required."
+      });
+    }
+
     const validPassword = await bcrypt.compare(
       password,
       user.passwordHash
     );
 
     if (!validPassword) {
+      console.log("Login rejected: password did not match.");
+
       return res.status(401).json({
         message: "Invalid email or password."
       });
     }
 
     const token = jwt.sign(
-      { sub: doc.id, email: user.email, role: user.role || "user" },
+      {
+        sub: doc.id,
+        email: user.email,
+        role: user.role || "user"
+      },
       process.env.JWT_SECRET,
       { expiresIn: "2h" }
     );
@@ -273,12 +303,14 @@ app.post("/api/auth/login", async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("Login failed:", error.message);
+    console.error("Login failed:", error);
+
     return res.status(500).json({
       message: "Unable to log in right now."
     });
   }
 });
+
 
 // Get the currently logged-in user
 app.get("/api/auth/me", async (req, res) => {

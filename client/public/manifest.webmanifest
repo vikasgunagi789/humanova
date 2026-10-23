@@ -1,0 +1,11 @@
+
+{
+  "name": "Humanova",
+  "short_name": "Humanova",
+  "description": "Intelligent Community Resource Coordination and Need Fulfillment System",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080808",
+  "theme_color": "#080808",
+  "icons": []
+}

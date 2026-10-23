@@ -1,5 +1,19 @@
 
 import { useCallback, useEffect, useState } from "react";
+
+import { useMemo } from "react";
+import {
+  MapContainer,
+  TileLayer,
+  Marker,
+  Popup,
+  useMap
+} from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+
+
 import {
   Activity,
   ArrowRight,
@@ -233,6 +247,233 @@ function Field({ label, children }) {
     </label>
   );
 }
+
+
+const DEFAULT_CENTER = [12.9141, 74.8560]; // Mangaluru fallback
+
+function MapRecenter({ center }) {
+  const map = useMap();
+
+  useEffect(() => {
+    map.setView(center, map.getZoom());
+  }, [map, center]);
+
+  return null;
+}
+
+function CommunityMap({ requests, resources }) {
+  const [points, setPoints] = useState([]);
+  const [mapLoading, setMapLoading] = useState(false);
+  const [mapError, setMapError] = useState("");
+  const [filter, setFilter] = useState("all");
+
+  const places = useMemo(() => [
+    ...requests
+      .filter((item) => item.location?.trim())
+      .map((item) => ({
+        id: `request-${item._id}`,
+        type: "request",
+        title: item.title || "Community need",
+        category: item.category || "Other",
+        location: item.location.trim(),
+        urgency: item.urgency || "Medium",
+        quantity: Number(item.quantity) || 0,
+        status: item.status || "Open",
+      })),
+    ...resources
+      .filter((item) => item.location?.trim())
+      .map((item) => ({
+        id: `resource-${item._id}`,
+        type: "resource",
+        title: item.title || "Available resource",
+        category: item.category || "Other",
+        location: item.location.trim(),
+        quantity: Number(item.quantity) || 0,
+        status: item.quantity > 0 ? "Available" : "Unavailable",
+      })),
+  ], [requests, resources]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function locatePlaces() {
+      setMapLoading(true);
+      setMapError("");
+      setPoints([]);
+
+      try {
+        const results = [];
+        const cache = new Map();
+
+        // Geocode sequentially to avoid sending many simultaneous requests.
+        for (const place of places) {
+          if (cancelled) return;
+
+          let coords = cache.get(place.location.toLowerCase());
+
+          if (!coords) {
+            const url = new URL(
+              "https://nominatim.openstreetmap.org/search"
+            );
+
+            url.searchParams.set("q", place.location);
+            url.searchParams.set("format", "jsonv2");
+            url.searchParams.set("limit", "1");
+
+            const response = await fetch(url.toString());
+
+            if (!response.ok) continue;
+
+            const data = await response.json();
+
+            if (!data.length) continue;
+
+            coords = [
+              Number(data[0].lat),
+              Number(data[0].lon)
+            ];
+
+            if (!coords.every(Number.isFinite)) continue;
+
+            cache.set(place.location.toLowerCase(), coords);
+          }
+
+          results.push({ ...place, position: coords });
+
+          // Keep requests to the public geocoder modest.
+          await new Promise((resolve) => setTimeout(resolve, 1100));
+        }
+
+        if (!cancelled) setPoints(results);
+      } catch (err) {
+        if (!cancelled) {
+          setMapError(
+            "Unable to load location data. Check your internet connection and try again."
+          );
+        }
+      } finally {
+        if (!cancelled) setMapLoading(false);
+      }
+    }
+
+    locatePlaces();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [places]);
+
+  const visiblePoints = points.filter((point) => {
+    if (filter === "all") return true;
+    return point.type === filter;
+  });
+
+  const center = visiblePoints[0]?.position || DEFAULT_CENTER;
+
+  return (
+    <section className="panel community-map-panel">
+      <div className="panel-heading">
+        <div>
+          <h3>Community location map</h3>
+          <p>
+            Explore saved requests and resources by location.
+          </p>
+        </div>
+        <MapPin size={22} />
+      </div>
+
+      <div className="map-toolbar">
+        <button
+          className={filter === "all" ? "map-filter active" : "map-filter"}
+          onClick={() => setFilter("all")}
+        >
+          All locations
+        </button>
+        <button
+          className={filter === "request" ? "map-filter active" : "map-filter"}
+          onClick={() => setFilter("request")}
+        >
+          Community needs
+        </button>
+        <button
+          className={filter === "resource" ? "map-filter active" : "map-filter"}
+          onClick={() => setFilter("resource")}
+        >
+          Resources
+        </button>
+      </div>
+
+      {mapLoading && (
+        <p className="map-message">Locating saved community addresses…</p>
+      )}
+
+      {mapError && (
+        <p className="map-message map-error">{mapError}</p>
+      )}
+
+      {!mapLoading && !mapError && visiblePoints.length === 0 && (
+        <p className="map-message">
+          No mapped locations yet. Add requests or resources with
+          recognizable addresses, towns, or areas.
+        </p>
+      )}
+
+      <div className="community-map">
+        <MapContainer
+          center={center}
+          zoom={11}
+          scrollWheelZoom
+          className="leaflet-map"
+        >
+          <MapRecenter center={center} />
+
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
+
+          {visiblePoints.map((point) => (
+            <Marker key={point.id} position={point.position}>
+              <Popup>
+                <strong>{point.title}</strong>
+                <br />
+                {point.type === "request"
+                  ? "Community need"
+                  : "Available resource"}
+                <br />
+                Category: {point.category}
+                <br />
+                Location: {point.location}
+                <br />
+                Quantity: {point.quantity}
+                <br />
+                Status: {point.status}
+                {point.urgency && (
+                  <>
+                    <br />
+                    Urgency: {point.urgency}
+                  </>
+                )}
+              </Popup>
+            </Marker>
+          ))}
+        </MapContainer>
+      </div>
+
+      <p className="map-attribution-note">
+        Map tiles © OpenStreetMap contributors. Locations are estimated
+        from the text entered in each record; verify them before coordinating
+        deliveries or emergency assistance.
+      </p>
+
+      <div className="map-count">
+        <MapPin size={15} />
+        {visiblePoints.length} mapped location(s)
+      </div>
+    </section>
+  );
+}
+
 
 function App() {
   // All React hooks belong inside the component.
@@ -691,6 +932,7 @@ async function cancelAllocation(allocation) {
   { id: "resources", label: "Resources", icon: Package },
   { id: "allocations", label: "Allocation history", icon: History },
   { id: "emergency", label: "Emergency mode", icon: Siren },
+  { id: "map", label: "Community map", icon: MapPin },
 ];
 
   const activeEmergencyRequests = emergency.requests;
@@ -887,7 +1129,9 @@ const filteredAllocations = allocations.filter((allocation) => {
         ? "Allocation history"
         : page === "emergency"
           ? "Community Emergency Mode"
-          : "Intelligent matching"}
+          : page === "map"
+  ? "Community location map"
+  : "Intelligent matching"}
             </h1>
           </div>
 
@@ -1167,6 +1411,13 @@ const filteredAllocations = allocations.filter((allocation) => {
             </section>
           </>
         )}
+
+        {page === "map" && (
+  <CommunityMap
+    requests={requests}
+    resources={resources}
+  />
+)}
 
         {page === "requests" && (
           <section className="panel page-panel">
