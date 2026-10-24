@@ -465,6 +465,55 @@ app.post("/api/requests", async (req, res, next) => {
   }
 });
 
+
+/**
+ * Dashboard summary
+ * Supplies the statistics and allocation history
+ * expected by the React frontend.
+ */
+app.get("/api/dashboard", async (req, res, next) => {
+  try {
+    const [requests, resources, allocations] = await Promise.all([
+      getAll("requests"),
+      getAll("resources"),
+      getAll("allocations")
+    ]);
+
+    const activeAllocations = allocations.filter(
+      (allocation) => allocation.status !== "Cancelled"
+    );
+
+    const totalRequests = requests.length;
+
+    const openRequests = requests.filter(
+      (request) => request.status === "Open"
+    ).length;
+
+    const availableResources = resources.filter(
+      (resource) => availableStock(resource) > 0
+    ).length;
+
+    const fulfilled = requests.filter(
+      (request) => request.status === "Fulfilled"
+    ).length;
+
+    return res.json({
+      totalRequests,
+      openRequests,
+      availableResources,
+      fulfilled,
+      allocations: activeAllocations.concat(
+        allocations.filter(
+          (allocation) => allocation.status === "Cancelled"
+        )
+      )
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
 // Get all resources
 app.get("/api/resources", async (req, res, next) => {
   try {
