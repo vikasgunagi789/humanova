@@ -1,6 +1,8 @@
-
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
 const {
@@ -11,11 +13,60 @@ const {
   create
 } = require("./firestoreStore");
 
+const {
+  createSecurityMiddleware,
+  authRateLimiter
+} = require("./security");
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+// Security and request parsing — register only once.
+app.use(helmet());
+
+app.use(cors({
+  origin: process.env.FRONTEND_URL || true
+}));
+
+app.use(express.json({ limit: "1mb" }));
+
+// Expose the same Firestore instance to security event handlers.
+app.locals.firestore = db;
+
+// Rate-limit authentication endpoints.
+app.use("/api/auth", authRateLimiter);
+
+// Public health endpoint; register before protected API middleware.
+app.get("/api/health", async (req, res) => {
+  try {
+    await db.collection("requests").limit(1).get();
+
+    return res.json({
+      status: "ok",
+      database: "Firestore",
+      message: "Humanova API and Firestore are connected."
+    });
+  } catch (error) {
+    console.error("Health check failed:", error.message);
+
+    return res.status(503).json({
+      status: "error",
+      database: "Firestore",
+      message: "Firestore is unavailable."
+    });
+  }
+});
+
+// Authenticate the remaining API routes.
+// The security middleware must exempt POST /auth/register
+// and POST /auth/login from JWT verification.
+app.use(
+  "/api",
+  ...createSecurityMiddleware({
+    db,
+    jwtSecret: process.env.JWT_SECRET
+  })
+);
 
 const categories = [
   "Food",
@@ -138,8 +189,6 @@ app.get("/api/health", async (req, res) => {
 });
 
 
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
 
 // Register a new user
 app.post("/api/auth/register", async (req, res) => {
@@ -315,33 +364,21 @@ app.post("/api/auth/login", async (req, res) => {
 // Get the currently logged-in user
 app.get("/api/auth/me", async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
+    const userId = req.user?.sub || req.user?.id;
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Authentication token is required",
+        message: "Authentication required."
       });
     }
 
-    const token = authHeader.split(" ")[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    const userId = decoded.sub;
-
-if (!userId) {
-  return res.status(401).json({
-    success: false,
-    message: "Invalid authentication token",
-  });
-}
-
-const userDoc = await db.collection("users").doc(userId).get();
+    const userDoc = await db.collection("users").doc(userId).get();
 
     if (!userDoc.exists) {
       return res.status(404).json({
         success: false,
-        message: "User not found",
+        message: "User not found."
       });
     }
 
@@ -353,60 +390,29 @@ const userDoc = await db.collection("users").doc(userId).get();
         id: userDoc.id,
         name: user.name,
         email: user.email,
-        role: user.role,
-      },
+        role: user.role || "user"
+      }
     });
   } catch (error) {
-    return res.status(401).json({
+    console.error("Could not load authenticated user:", error.message);
+
+    return res.status(500).json({
       success: false,
-      message: "Invalid or expired authentication token",
+      message: "Unable to load your account."
     });
   }
 });
 
 
-// Dashboard
-app.get("/api/dashboard", async (req, res, next) => {
-  try {
-    const [requests, resources, allocations] = await Promise.all([
-      getAll("requests"),
-      getAll("resources"),
-      getAll("allocations")
-    ]);
-
-    res.json({
-      totalRequests: requests.length,
-      openRequests: requests.filter(
-        item => item.status === "Open"
-      ).length,
-      matchedRequests: requests.filter(
-        item => item.status === "Matched"
-      ).length,
-      fulfilledRequests: requests.filter(
-        item => item.status === "Fulfilled"
-      ).length,
-      totalResources: resources.length,
-      availableResources: resources.filter(
-        item => availableStock(item) > 0 && !isExpired(item)
-      ).length,
-      totalAllocations: allocations.length,
-      requests,
-      resources,
-      allocations
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Get all requests
 app.get("/api/requests", async (req, res, next) => {
   try {
-    res.json(await getAll("requests"));
+    const requests = await getAll("requests");
+    return res.json(requests);
   } catch (error) {
     next(error);
   }
 });
+
 
 // Create a request
 app.post("/api/requests", async (req, res, next) => {

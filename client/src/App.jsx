@@ -261,37 +261,67 @@ function MapRecenter({ center }) {
   return null;
 }
 
+// Div-based icons avoid Vite/Leaflet's missing default marker-image problem.
+function createCommunityMarker(type) {
+  const isRequest = type === "request";
+  const color = isRequest ? "#ef4444" : "#10b981";
+  const symbol = isRequest ? "!" : "+";
+
+  return L.divIcon({
+    className: "humanova-leaflet-marker-wrap",
+    html: `<span class="humanova-leaflet-marker" style="--marker-color:${color}">${symbol}</span>`,
+    iconSize: [34, 42],
+    iconAnchor: [17, 39],
+    popupAnchor: [0, -36],
+  });
+}
+
+
 function CommunityMap({ requests, resources }) {
   const [points, setPoints] = useState([]);
   const [mapLoading, setMapLoading] = useState(false);
   const [mapError, setMapError] = useState("");
   const [filter, setFilter] = useState("all");
 
-  const places = useMemo(() => [
-    ...requests
-      .filter((item) => item.location?.trim())
-      .map((item) => ({
-        id: `request-${item._id}`,
-        type: "request",
-        title: item.title || "Community need",
-        category: item.category || "Other",
-        location: item.location.trim(),
-        urgency: item.urgency || "Medium",
-        quantity: Number(item.quantity) || 0,
-        status: item.status || "Open",
-      })),
-    ...resources
-      .filter((item) => item.location?.trim())
-      .map((item) => ({
-        id: `resource-${item._id}`,
-        type: "resource",
-        title: item.title || "Available resource",
-        category: item.category || "Other",
-        location: item.location.trim(),
-        quantity: Number(item.quantity) || 0,
-        status: item.quantity > 0 ? "Available" : "Unavailable",
-      })),
-  ], [requests, resources]);
+  const places = useMemo(
+    () => [
+      ...requests
+        .filter(
+          (item) =>
+            typeof item.location === "string" &&
+            item.location.trim()
+        )
+        .map((item) => ({
+          id: `request-${item._id}`,
+          type: "request",
+          title: item.title || "Community need",
+          category: item.category || "Other",
+          location: item.location.trim(),
+          urgency: item.urgency || "Medium",
+          quantity: Number(item.quantity) || 0,
+          status: item.status || "Open",
+        })),
+      ...resources
+        .filter(
+          (item) =>
+            typeof item.location === "string" &&
+            item.location.trim()
+        )
+        .map((item) => ({
+          id: `resource-${item._id}`,
+          type: "resource",
+          title: item.title || "Available resource",
+          category: item.category || "Other",
+          location: item.location.trim(),
+          quantity: Number(item.quantity) || 0,
+          status:
+            Number(item.quantity) > 0
+              ? "Available"
+              : "Unavailable",
+        })),
+    ],
+    [requests, resources]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -304,55 +334,118 @@ function CommunityMap({ requests, resources }) {
       try {
         const results = [];
         const cache = new Map();
+        const failures = [];
 
-        // Geocode sequentially to avoid sending many simultaneous requests.
         for (const place of places) {
           if (cancelled) return;
 
-          let coords = cache.get(place.location.toLowerCase());
+          const cacheKey = place.location.toLowerCase();
+
+          let coords = cache.get(cacheKey);
 
           if (!coords) {
-            const url = new URL(
-              "https://nominatim.openstreetmap.org/search"
-            );
+            const rawLocation = place.location.trim();
 
-            url.searchParams.set("q", place.location);
-            url.searchParams.set("format", "jsonv2");
-            url.searchParams.set("limit", "1");
+            const searchLocation =
+              /\b(india|karnataka)\b/i.test(rawLocation)
+                ? rawLocation
+                : `${rawLocation}, Karnataka, India`;
 
-            const response = await fetch(url.toString());
+            try {
+              const url = new URL(
+                "https://nominatim.openstreetmap.org/search"
+              );
 
-            if (!response.ok) continue;
+              url.searchParams.set("q", searchLocation);
+              url.searchParams.set("format", "jsonv2");
+              url.searchParams.set("limit", "1");
 
-            const data = await response.json();
+              const response = await fetch(url.toString(), {
+                headers: {
+                  Accept: "application/json",
+                },
+              });
 
-            if (!data.length) continue;
+              if (!response.ok) {
+                throw new Error(
+                  `Geocoder returned HTTP ${response.status}`
+                );
+              }
 
-            coords = [
-              Number(data[0].lat),
-              Number(data[0].lon)
-            ];
+              const data = await response.json();
 
-            if (!coords.every(Number.isFinite)) continue;
+              if (!Array.isArray(data) || data.length === 0) {
+                failures.push(place.location);
+                continue;
+              }
 
-            cache.set(place.location.toLowerCase(), coords);
+              const lat = Number(data[0].lat);
+              const lon = Number(data[0].lon);
+
+              if (
+                !Number.isFinite(lat) ||
+                !Number.isFinite(lon)
+              ) {
+                failures.push(place.location);
+                continue;
+              }
+
+              coords = [lat, lon];
+              cache.set(cacheKey, coords);
+
+              // Keep requests to the public geocoder modest.
+              await new Promise((resolve) =>
+                setTimeout(resolve, 1100)
+              );
+            } catch (error) {
+              console.error(
+                "Humanova geocoding failed:",
+                place.location,
+                error
+              );
+
+              failures.push(place.location);
+              continue;
+            }
           }
 
-          results.push({ ...place, position: coords });
-
-          // Keep requests to the public geocoder modest.
-          await new Promise((resolve) => setTimeout(resolve, 1100));
+          results.push({
+            ...place,
+            position: coords,
+          });
         }
 
-        if (!cancelled) setPoints(results);
-      } catch (err) {
+        if (cancelled) return;
+
+        setPoints(results);
+
+        if (places.length === 0) {
+          setMapError(
+            "No requests or resources have a saved location yet. Add a request or resource with a locality to display markers."
+          );
+        } else if (results.length === 0) {
+          setMapError(
+            `Could not map any of the ${places.length} saved location(s). Check your internet connection and the browser console for geocoding errors.`
+          );
+        } else if (failures.length > 0) {
+          setMapError(
+            `${results.length} location(s) mapped. Could not locate: ${[
+              ...new Set(failures),
+            ].join(", ")}. Try entering a town, district and state.`
+          );
+        }
+      } catch (error) {
+        console.error("Humanova map error:", error);
+
         if (!cancelled) {
           setMapError(
-            "Unable to load location data. Check your internet connection and try again."
+            "Unable to load location data. Check the browser console and your internet connection."
           );
         }
       } finally {
-        if (!cancelled) setMapLoading(false);
+        if (!cancelled) {
+          setMapLoading(false);
+        }
       }
     }
 
@@ -384,19 +477,34 @@ function CommunityMap({ requests, resources }) {
 
       <div className="map-toolbar">
         <button
-          className={filter === "all" ? "map-filter active" : "map-filter"}
+          type="button"
+          className={
+            filter === "all" ? "map-filter active" : "map-filter"
+          }
           onClick={() => setFilter("all")}
         >
           All locations
         </button>
+
         <button
-          className={filter === "request" ? "map-filter active" : "map-filter"}
+          type="button"
+          className={
+            filter === "request"
+              ? "map-filter active"
+              : "map-filter"
+          }
           onClick={() => setFilter("request")}
         >
           Community needs
         </button>
+
         <button
-          className={filter === "resource" ? "map-filter active" : "map-filter"}
+          type="button"
+          className={
+            filter === "resource"
+              ? "map-filter active"
+              : "map-filter"
+          }
           onClick={() => setFilter("resource")}
         >
           Resources
@@ -404,23 +512,20 @@ function CommunityMap({ requests, resources }) {
       </div>
 
       {mapLoading && (
-        <p className="map-message">Locating saved community addresses…</p>
+        <p className="map-message">
+          Locating saved community addresses…
+        </p>
       )}
 
       {mapError && (
-        <p className="map-message map-error">{mapError}</p>
-      )}
-
-      {!mapLoading && !mapError && visiblePoints.length === 0 && (
-        <p className="map-message">
-          No mapped locations yet. Add requests or resources with
-          recognizable addresses, towns, or areas.
+        <p className="map-message map-error" role="status">
+          {mapError}
         </p>
       )}
 
       <div className="community-map">
         <MapContainer
-          center={center}
+          center={DEFAULT_CENTER}
           zoom={11}
           scrollWheelZoom
           className="leaflet-map"
@@ -433,7 +538,11 @@ function CommunityMap({ requests, resources }) {
           />
 
           {visiblePoints.map((point) => (
-            <Marker key={point.id} position={point.position}>
+            <Marker
+              key={point.id}
+              position={point.position}
+              icon={createCommunityMarker(point.type)}
+            >
               <Popup>
                 <strong>{point.title}</strong>
                 <br />
@@ -461,9 +570,9 @@ function CommunityMap({ requests, resources }) {
       </div>
 
       <p className="map-attribution-note">
-        Map tiles © OpenStreetMap contributors. Locations are estimated
-        from the text entered in each record; verify them before coordinating
-        deliveries or emergency assistance.
+        Map tiles © OpenStreetMap contributors. Locations are
+        estimated from saved address text. Verify them before
+        coordinating deliveries or emergency assistance.
       </p>
 
       <div className="map-count">
@@ -473,6 +582,7 @@ function CommunityMap({ requests, resources }) {
     </section>
   );
 }
+
 
 
 function App() {
