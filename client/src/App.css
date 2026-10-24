@@ -182,3 +182,44 @@
     border-right-color: var(--border);
   }
 }
+
+
+/* User account and logout */
+.signed-in-user {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #334155;
+}
+
+.signout-button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 11px;
+  border: 1px solid #f87171;
+  border-radius: 8px;
+  background: transparent;
+  color: #f87171;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.signout-button:hover {
+  background: rgba(248, 113, 113, 0.12);
+}
+
+/* Sidebar scrolling */
+.sidebar {
+  height: 100vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-bottom {
+  margin-top: auto;
+  padding: 16px 14px;
+  flex-shrink: 0;
+}

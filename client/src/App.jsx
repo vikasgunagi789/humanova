@@ -34,6 +34,7 @@ import {
   Sparkles,
   TriangleAlert,
   Users,
+   UserRound,
   X,
   Siren,
 } from "lucide-react";
@@ -590,8 +591,19 @@ function App() {
   const [page, setPage] = useState("dashboard");
   const [authToken, setAuthToken] = useState(() => localStorage.getItem("humanova_token") || "");
   const [currentUser, setCurrentUser] = useState(null);
+  const [profileActivity, setProfileActivity] = useState({ resources: [], requests: [], summary: {} });
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState("");
   const [authMode, setAuthMode] = useState("login");
-  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
+  const [authForm, setAuthForm] = useState({
+  name: "",
+  email: "",
+  password: "",
+  phone: "",
+  address: "",
+  locality: "",
+  accountType: "Individual",
+});
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [dashboard, setDashboard] = useState({});
@@ -672,6 +684,32 @@ setEmergency(normalizeEmergency(emergencyData));
   }, []);
 
   useEffect(() => {
+    if (page !== "profile" || !authToken) return;
+
+    let active = true;
+    setProfileLoading(true);
+    setProfileError("");
+
+    api("/profile/activity")
+      .then((data) => {
+        if (!active) return;
+        setProfileActivity({
+          resources: Array.isArray(data?.resources) ? data.resources : [],
+          requests: Array.isArray(data?.requests) ? data.requests : [],
+          summary: data?.summary || {},
+        });
+      })
+      .catch((err) => {
+        if (active) setProfileError(err.message || "Could not load your activity.");
+      })
+      .finally(() => {
+        if (active) setProfileLoading(false);
+      });
+
+    return () => { active = false; };
+  }, [page, authToken]);
+
+  useEffect(() => {
     let active = true;
     if (!authToken) {
       setCurrentUser(null);
@@ -702,14 +740,34 @@ setEmergency(normalizeEmergency(emergencyData));
     setAuthError("");
     try {
       const endpoint = authMode === "register" ? "/auth/register" : "/auth/login";
-      const payload = authMode === "register"
-        ? { name: authForm.name.trim(), email: authForm.email.trim(), password: authForm.password }
-        : { email: authForm.email.trim(), password: authForm.password };
+      const payload =
+  authMode === "register"
+    ? {
+        name: authForm.name.trim(),
+        email: authForm.email.trim(),
+        password: authForm.password,
+        phone: authForm.phone.trim(),
+        address: authForm.address.trim(),
+        locality: authForm.locality.trim(),
+        accountType: authForm.accountType,
+      }
+    : {
+        email: authForm.email.trim(),
+        password: authForm.password,
+      };
       const result = await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
       localStorage.setItem("humanova_token", result.token);
       setAuthToken(result.token);
       setCurrentUser(result.user || null);
-      setAuthForm({ name: "", email: "", password: "" });
+      setAuthForm({
+  name: "",
+  email: "",
+  password: "",
+  phone: "",
+  address: "",
+  locality: "",
+  accountType: "Individual",
+});
     } catch (err) {
       setAuthError(err.message || "Authentication failed.");
     } finally {
@@ -1140,7 +1198,84 @@ const filteredAllocations = allocations.filter((allocation) => {
             <h2>{authMode === "register" ? "Create your account" : "Welcome back"}</h2>
             <p className="auth-subtitle">{authMode === "register" ? "Join your community's resource network." : "Sign in to continue to your community workspace."}</p>
             {authError && <div className="auth-error" role="alert">{authError}</div>}
-            {authMode === "register" && <label className="auth-field">Full name<input autoComplete="name" value={authForm.name} onChange={(e) => setAuthForm((v) => ({ ...v, name: e.target.value }))} placeholder="Your name" required minLength={2} /></label>}
+            
+{authMode === "register" && (
+  <>
+    <label className="auth-field">
+      Full name
+      <input
+        autoComplete="name"
+        value={authForm.name}
+        onChange={(e) =>
+          setAuthForm((v) => ({ ...v, name: e.target.value }))
+        }
+        placeholder="Your full name"
+        required
+        minLength={2}
+      />
+    </label>
+
+    <label className="auth-field">
+      Phone number
+      <input
+        type="tel"
+        autoComplete="tel"
+        value={authForm.phone}
+        onChange={(e) =>
+          setAuthForm((v) => ({ ...v, phone: e.target.value }))
+        }
+        placeholder="Your phone number"
+        required
+      />
+    </label>
+
+    <label className="auth-field">
+      Full address
+      <input
+        autoComplete="street-address"
+        value={authForm.address}
+        onChange={(e) =>
+          setAuthForm((v) => ({ ...v, address: e.target.value }))
+        }
+        placeholder="House number, street or area"
+        required
+      />
+    </label>
+
+    <label className="auth-field">
+      Locality / Town
+      <input
+        autoComplete="address-level2"
+        value={authForm.locality}
+        onChange={(e) =>
+          setAuthForm((v) => ({ ...v, locality: e.target.value }))
+        }
+        placeholder="Your town or locality"
+        required
+      />
+    </label>
+
+    <label className="auth-field">
+      Account type
+      <select
+        value={authForm.accountType}
+        onChange={(e) =>
+          setAuthForm((v) => ({
+            ...v,
+            accountType: e.target.value,
+          }))
+        }
+        required
+      >
+        <option value="Individual">Individual / Person in need</option>
+        <option value="Volunteer">Volunteer</option>
+        <option value="NGO">NGO</option>
+        <option value="Resource Provider">Resource Provider / Donor</option>
+      </select>
+    </label>
+  </>
+)}
+
             <label className="auth-field">Email address<input type="email" autoComplete="email" value={authForm.email} onChange={(e) => setAuthForm((v) => ({ ...v, email: e.target.value }))} placeholder="you@example.com" required /></label>
             <label className="auth-field">Password<input type="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} value={authForm.password} onChange={(e) => setAuthForm((v) => ({ ...v, password: e.target.value }))} placeholder={authMode === "register" ? "At least 8 characters" : "Enter your password"} required minLength={authMode === "register" ? 8 : 1} /></label>
             <button className="btn primary auth-submit" type="submit" disabled={authBusy}>{authBusy ? "Please wait…" : authMode === "register" ? "Create account" : "Sign in"}<ArrowRight size={17} /></button>
@@ -1204,23 +1339,57 @@ const filteredAllocations = allocations.filter((allocation) => {
             <BrainCircuit size={19} />
             Smart matching
           </button>
+
+          <button
+  type="button"
+  className={`nav-item ${page === "profile" ? "active" : ""}`}
+  onClick={() => setPage("profile")}
+>
+  <UserRound size={19} />
+  <span>My Profile</span>
+</button>
         </nav>
 
+        
         <div className="sidebar-bottom">
           <div className="community-icon">
             <Users size={21} />
           </div>
+
           <strong>Stronger together.</strong>
+
           <p>
             Small acts of support create meaningful community impact.
           </p>
+
           <div className="connection">
             <span />
             API connected when available
           </div>
-          <div className="signed-in-user"><span className="user-avatar">{(currentUser?.name || "U").slice(0, 1).toUpperCase()}</span><span className="signed-in-copy"><strong>{currentUser?.name || "Community member"}</strong><small>{currentUser?.email || "Signed in"}</small></span><button type="button" className="signout-button" onClick={signOut} title="Sign out" aria-label="Sign out"><X size={16} /></button></div>
+
+          <div className="signed-in-user">
+            <span className="user-avatar">
+              {(currentUser?.name || "U").slice(0, 1).toUpperCase()}
+            </span>
+
+            <span className="signed-in-copy">
+              <strong>{currentUser?.name || "Community member"}</strong>
+              <small>{currentUser?.email || "Signed in"}</small>
+            </span>
+
+            <button
+    type="button"
+    className="signout-button"
+    onClick={signOut}
+  >
+    <X size={16} />
+
+  </button>
+          </div>
         </div>
       </aside>
+
+
 
       <main className="main-content">
         <header className="topbar">
@@ -1240,8 +1409,10 @@ const filteredAllocations = allocations.filter((allocation) => {
         : page === "emergency"
           ? "Community Emergency Mode"
           : page === "map"
-  ? "Community location map"
-  : "Intelligent matching"}
+            ? "Community location map"
+            : page === "profile"
+              ? "My Profile"
+              : "Intelligent matching"}
             </h1>
           </div>
 
@@ -2095,6 +2266,92 @@ disabled={
                 )}
               </div>
             )}
+          </section>
+        )}
+
+        {page === "profile" && (
+          <section className="profile-page">
+            <div className="panel-heading">
+              <div>
+                <h2>My Profile</h2>
+                <p>Your account details and the community activity you have added.</p>
+              </div>
+              <button type="button" className="btn primary" onClick={() => {
+                setPage("profile");
+                setProfileLoading(true);
+                setProfileError("");
+                api("/profile/activity")
+                  .then((data) => setProfileActivity({
+                    resources: Array.isArray(data?.resources) ? data.resources : [],
+                    requests: Array.isArray(data?.requests) ? data.requests : [],
+                    summary: data?.summary || {},
+                  }))
+                  .catch((err) => setProfileError(err.message || "Could not refresh your activity."))
+                  .finally(() => setProfileLoading(false));
+              }} disabled={profileLoading}>
+                <RefreshCw size={16} /> {profileLoading ? "Refreshing…" : "Refresh activity"}
+              </button>
+            </div>
+
+            {profileError && <div className="alert error" role="alert">{profileError}</div>}
+
+            <div className="profile-card">
+              <div className="profile-details">
+                <p><strong>Name:</strong> {currentUser?.name || "Not available"}</p>
+                <p><strong>Email:</strong> {currentUser?.email || "Not available"}</p>
+                <p><strong>Phone:</strong> {currentUser?.phone || "Not available"}</p>
+                <p><strong>Address:</strong> {currentUser?.address || "Not available"}</p>
+                <p><strong>Locality:</strong> {currentUser?.locality || "Not available"}</p>
+                <p><strong>Account type:</strong> {currentUser?.accountType || "Not available"}</p>
+              </div>
+            </div>
+
+            <div className="stats-grid profile-stats-grid">
+              <article className="stat-card"><div className="stat-icon blue"><Package size={21} /></div><p>My resources</p><h2>{profileLoading ? "…" : (profileActivity.summary.totalResources ?? profileActivity.resources.length)}</h2></article>
+              <article className="stat-card"><div className="stat-icon purple"><HandHeart size={21} /></div><p>My community needs</p><h2>{profileLoading ? "…" : (profileActivity.summary.totalRequests ?? profileActivity.requests.length)}</h2></article>
+              <article className="stat-card"><div className="stat-icon orange"><Clock3 size={21} /></div><p>Open needs</p><h2>{profileLoading ? "…" : (profileActivity.summary.openRequests ?? profileActivity.requests.filter((item) => item.status === "Open").length)}</h2></article>
+              <article className="stat-card"><div className="stat-icon green"><CheckCircle2 size={21} /></div><p>Fulfilled needs</p><h2>{profileLoading ? "…" : (profileActivity.summary.fulfilledRequests ?? profileActivity.requests.filter((item) => item.status === "Fulfilled").length)}</h2></article>
+            </div>
+
+            <section className="panel page-panel">
+              <div className="panel-heading"><div><h3>Resources I added</h3><p>Only resources created by your account.</p></div><Package size={21} /></div>
+              {profileLoading ? <EmptyState text="Loading your resources…" /> : profileActivity.resources.length === 0 ? <EmptyState text="You have not added any resources yet. Use Add resource to offer something to your community." /> : (
+                <div className="resource-grid">
+                  {profileActivity.resources.map((resource, index) => (
+                    <article className="resource-card" key={resource._id || resource.id || index}>
+                      <div className="resource-symbol"><Package size={22} /></div>
+                      <span className="category-label">{resource.category || "Other"}</span>
+                      <h3>{resource.title || "Untitled resource"}</h3>
+                      <p>{resource.description || "Community resource offered to help meet local needs."}</p>
+                      <div className="resource-meta"><MapPin size={15} />{resource.location || "Location not specified"}</div>
+                      <div className="quantity-row"><span>Quantity available</span><strong>{resource.quantity ?? 0}</strong></div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            <section className="panel page-panel">
+              <div className="panel-heading"><div><h3>Community needs I created</h3><p>Track the requests you submitted and their current status.</p></div><HandHeart size={21} /></div>
+              {profileLoading ? <EmptyState text="Loading your community needs…" /> : profileActivity.requests.length === 0 ? <EmptyState text="You have not created any community needs yet." /> : (
+                <div className="profile-activity-list">
+                  {profileActivity.requests.map((request, index) => (
+                    <article className="request-card" key={request._id || request.id || index}>
+                      <div className="panel-heading">
+                        <div><span className="category-label">{request.category || "Other"}</span><h3>{request.title || "Untitled community need"}</h3></div>
+                        <span className={`request-status status-${String(request.status || "open").toLowerCase().replace(/\s+/g, "-")}`}>{request.status || "Open"}</span>
+                      </div>
+                      <p>{request.description || "No description provided."}</p>
+                      <div className="resource-meta"><MapPin size={15} />{request.location || "Location not specified"}</div>
+                      <div className="quantity-row"><span>Quantity needed</span><strong>{request.quantity ?? 0}</strong></div>
+                      <div className="quantity-row"><span>Urgency</span><strong>{request.urgency || "Medium"}</strong></div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            <button type="button" className="btn secondary" onClick={() => setPage("dashboard")}>Back to Dashboard</button>
           </section>
         )}
 

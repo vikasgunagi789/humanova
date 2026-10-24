@@ -25,11 +25,22 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 button:focus-visible, input:focus-visible, select:focus-visible,
 textarea:focus-visible { outline: 3px solid #8ad8cd; outline-offset: 2px; }
 .app-shell { min-height: 100vh; }
+
 .sidebar {
-  width: 258px; position: fixed; inset: 0 auto 0 0;
-  background: var(--navy); color: white; padding: 27px 19px;
-  display: flex; flex-direction: column; z-index: 5;
+  width: 258px;
+  height: 100vh;
+  position: fixed;
+  inset: 0 auto 0 0;
+  box-sizing: border-box;
+  background: var(--navy);
+  color: white;
+  padding: 20px 19px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  z-index: 5;
 }
+
 .brand { display: flex; gap: 11px; align-items: center; padding: 0 4px 36px; }
 .brand-mark {
   width: 44px; height: 44px; border-radius: 13px;
@@ -2447,3 +2458,59 @@ footer { display: flex; justify-content: space-between; gap: 12px; padding: 25px
 .humanova-leaflet-marker-symbol {
   transform: rotate(45deg);
 }
+
+.profile-page {
+  padding: 24px;
+}
+
+.profile-card {
+  max-width: 700px;
+  margin-top: 24px;
+  padding: 28px;
+  border: 1px solid #2b3b45;
+  border-radius: 18px;
+  background: #131c24;
+  color: #ffffff;
+}
+
+.profile-card h2 {
+  margin-bottom: 24px;
+}
+
+.profile-details p {
+  padding: 12px 0;
+  border-bottom: 1px solid #2b3b45;
+  overflow-wrap: anywhere;
+}
+
+.profile-card button {
+  margin-top: 20px;
+  padding: 12px 18px;
+  border: none;
+  border-radius: 8px;
+  background: #00c9a7;
+  color: #071510;
+  cursor: pointer;
+}
+/* .sidebar nav button.nav-item {
+  display: flex !important;
+  align-items: center !important;
+  gap: 14px !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+  padding: 15px 16px !important;
+  margin: 5px 0 !important;
+  border: none !important;
+  border-radius: 12px !important;
+  background: transparent !important;
+  color: #d0dce5 !important;
+  font-family: inherit !important;
+  font-size: 15px !important;
+  text-align: left !important;
+  cursor: pointer !important;
+} */
+
+/* .sidebar nav button.nav-item.active {
+  background: #087f78 !important;
+  color: #ffffff !important;
+} */

@@ -86,6 +86,58 @@ function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+const ACCOUNT_TYPES = [
+  "Individual",
+  "Volunteer",
+  "NGO",
+  "Resource Provider"
+];
+
+function sanitizeProfile(userId, user) {
+  return {
+    id: userId,
+    name: user.name || "",
+    email: user.email || "",
+    phone: user.phone || "",
+    address: user.address || "",
+    locality: user.locality || "",
+    accountType: user.accountType || "Individual",
+    verificationStatus: user.verificationStatus || "Pending"
+  };
+}
+
+function validateProfile(body) {
+  const profile = {
+    name: cleanString(body.name),
+    phone: cleanString(body.phone),
+    address: cleanString(body.address),
+    locality: cleanString(body.locality),
+    accountType: cleanString(body.accountType)
+  };
+
+  if (profile.name.length < 2 || profile.name.length > 100) {
+    return { error: "Name must be between 2 and 100 characters." };
+  }
+
+  if (!/^[+()\d\s-]{7,20}$/.test(profile.phone)) {
+    return { error: "Enter a valid phone number." };
+  }
+
+  if (!profile.address || profile.address.length > 250) {
+    return { error: "Enter an address of up to 250 characters." };
+  }
+
+  if (!profile.locality || profile.locality.length > 100) {
+    return { error: "Enter a locality of up to 100 characters." };
+  }
+
+  if (!ACCOUNT_TYPES.includes(profile.accountType)) {
+    return { error: "Choose a valid account type." };
+  }
+
+  return { profile };
+}
+
 function validQuantity(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -193,9 +245,16 @@ app.get("/api/health", async (req, res) => {
 // Register a new user
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const name = String(req.body.name || req.body.fullName || "").trim();
-    const email = String(req.body.email || "").trim().toLowerCase();
-    const password = req.body.password;
+    const email = cleanString(req.body.email).toLowerCase();
+const password = req.body.password;
+
+const { profile, error: profileError } = validateProfile(req.body);
+
+if (profileError) {
+  return res.status(400).json({ message: profileError });
+}
+
+const { name, phone, address, locality, accountType } = profile;
 
     if (!name || !email || typeof password !== "string") {
       return res.status(400).json({
@@ -234,15 +293,25 @@ app.post("/api/auth/register", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const userRef = users.doc();
+const userRef = users.doc();
 
-    await userRef.create({
-      name,
-      email,
-      passwordHash,
-      role: "user",
-      createdAt: new Date()
-    });
+const userProfile = sanitizeProfile(userRef.id, {
+  name,
+  email,
+  phone,
+  address,
+  locality,
+  accountType,
+  verificationStatus: "Pending"
+});
+
+await userRef.create({
+  ...userProfile,
+  passwordHash,
+  role: "user",
+  createdAt: new Date(),
+  updatedAt: new Date()
+});
 
     const token = jwt.sign(
       { sub: userRef.id, email, role: "user" },
@@ -251,10 +320,13 @@ app.post("/api/auth/register", async (req, res) => {
     );
 
     return res.status(201).json({
-      message: "Account created successfully.",
-      token,
-      user: { id: userRef.id, name, email, role: "user" }
-    });
+  message: "Account created successfully.",
+  token,
+  user: {
+    ...userProfile,
+    role: "user"
+  }
+});
   } catch (error) {
     console.error("Registration failed:", error.message);
     return res.status(500).json({
@@ -342,15 +414,13 @@ app.post("/api/auth/login", async (req, res) => {
     );
 
     return res.json({
-      message: "Login successful.",
-      token,
-      user: {
-        id: doc.id,
-        name: user.name,
-        email: user.email,
-        role: user.role || "user"
-      }
-    });
+  message: "Login successful.",
+  token,
+  user: {
+    ...sanitizeProfile(doc.id, user),
+    role: user.role || "user"
+  }
+});
   } catch (error) {
     console.error("Login failed:", error);
 
@@ -385,14 +455,12 @@ app.get("/api/auth/me", async (req, res) => {
     const user = userDoc.data();
 
     return res.json({
-      success: true,
-      user: {
-        id: userDoc.id,
-        name: user.name,
-        email: user.email,
-        role: user.role || "user"
-      }
-    });
+  success: true,
+  user: {
+    ...sanitizeProfile(userDoc.id, user),
+    role: user.role || "user"
+  }
+});
   } catch (error) {
     console.error("Could not load authenticated user:", error.message);
 
@@ -403,6 +471,53 @@ app.get("/api/auth/me", async (req, res) => {
   }
 });
 
+
+/**
+ * Get the logged-in user's profile activity.
+ * Returns only resources and requests owned by this user.
+ */
+app.get("/api/profile/activity", async (req, res, next) => {
+  try {
+    const userId = req.user?.sub || req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Please log in to view your profile."
+      });
+    }
+
+    const [allResources, allRequests] = await Promise.all([
+      getAll("resources"),
+      getAll("requests")
+    ]);
+
+    const myResources = allResources.filter(
+      (resource) => resource.ownerId === userId
+    );
+
+    const myRequests = allRequests.filter(
+      (request) => request.ownerId === userId
+    );
+
+    return res.json({
+      success: true,
+      resources: myResources,
+      requests: myRequests,
+      summary: {
+        totalResources: myResources.length,
+        totalRequests: myRequests.length,
+        fulfilledRequests: myRequests.filter(
+          (request) => request.status === "Fulfilled"
+        ).length,
+        openRequests: myRequests.filter(
+          (request) => request.status === "Open"
+        ).length
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get("/api/requests", async (req, res, next) => {
   try {
@@ -417,6 +532,25 @@ app.get("/api/requests", async (req, res, next) => {
 // Create a request
 app.post("/api/requests", async (req, res, next) => {
   try {
+
+    const userId = req.user?.sub || req.user?.id;
+
+if (!userId) {
+  return res.status(401).json({
+    message: "Please log in before creating a request."
+  });
+}
+
+const userDoc = await db.collection("users").doc(userId).get();
+
+if (!userDoc.exists) {
+  return res.status(401).json({
+    message: "User account not found. Please log in again."
+  });
+}
+
+const user = userDoc.data();
+
     const title = cleanString(req.body.title);
     const category = cleanString(req.body.category);
     const location = cleanString(req.body.location);
@@ -449,15 +583,24 @@ app.post("/api/requests", async (req, res, next) => {
     }
 
     const request = await create("requests", {
-      title,
-      description,
-      category,
-      quantity,
-      allocatedQuantity: 0,
-      location,
-      urgency,
-      status: "Open"
-    });
+  title,
+  description,
+  category,
+  quantity,
+  allocatedQuantity: 0,
+  location,
+  urgency,
+  status: "Open",
+
+  // Link this request to its authenticated owner.
+  ownerId: userId,
+  ownerName: user.name || "Unknown user",
+  ownerLocality: user.locality || "",
+  ownerAccountType: user.accountType || "Individual",
+  ownerVerificationStatus: user.verificationStatus || "Pending",
+
+  createdAt: new Date()
+});
 
     res.status(201).json(request);
   } catch (error) {
@@ -526,6 +669,24 @@ app.get("/api/resources", async (req, res, next) => {
 // Create a resource
 app.post("/api/resources", async (req, res, next) => {
   try {
+
+    const userId = req.user?.sub || req.user?.id;
+
+if (!userId) {
+  return res.status(401).json({
+    message: "Please log in before adding a resource."
+  });
+}
+
+const userDoc = await db.collection("users").doc(userId).get();
+
+if (!userDoc.exists) {
+  return res.status(401).json({
+    message: "User account not found. Please log in again."
+  });
+}
+
+const user = userDoc.data();
     const title = cleanString(req.body.title);
     const category = cleanString(req.body.category);
     const location = cleanString(req.body.location);
@@ -565,13 +726,22 @@ app.post("/api/resources", async (req, res, next) => {
     }
 
     const resource = await create("resources", {
-      title,
-      description,
-      category,
-      quantity,
-      location,
-      availableUntil
-    });
+  title,
+  description,
+  category,
+  quantity,
+  location,
+  availableUntil,
+
+  // Link this resource to its authenticated owner.
+  ownerId: userId,
+  ownerName: user.name || "Unknown user",
+  ownerLocality: user.locality || "",
+  ownerAccountType: user.accountType || "Individual",
+  ownerVerificationStatus: user.verificationStatus || "Pending",
+
+  createdAt: new Date()
+});
 
     res.status(201).json(resource);
   } catch (error) {
@@ -988,6 +1158,25 @@ app.patch("/api/requests/:id/status", async (req, res, next) => {
       }
 
       const request = snapshot.data();
+
+      const userId = req.user?.sub || req.user?.id;
+
+if (!userId) {
+  const error = new Error("Authentication required.");
+  error.statusCode = 401;
+  throw error;
+}
+
+const isOwner = request.ownerId === userId;
+const isAdmin = req.user?.role === "admin";
+
+if (!isOwner && !isAdmin) {
+  const error = new Error(
+    "You are not allowed to update this request."
+  );
+  error.statusCode = 403;
+  throw error;
+}
 
       if (
         status === "Fulfilled" &&
